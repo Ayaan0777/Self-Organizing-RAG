@@ -1,2 +1,7 @@
 {
+  "python.analysis.extraPaths": [
+    "."
+  ],
+  "python.defaultInterpreterPath": "c:\\Users\\hegde\\Desktop\\Self-Oragnising-RAG\\myenv\\Scripts\\python.exe",
+  "python.pythonPath": "c:\\Users\\hegde\\Desktop\\Self-Oragnising-RAG\\myenv\\Scripts\\python.exe"
 }
