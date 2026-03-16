@@ -1,5 +1,5 @@
 from pinecone import Pinecone
-pc = Pinecone(api_key="pcsk_7NB7zH_SpE3gUarYzzrtVkH4GQ8kVKDp5fwkbUwgpNpmpZfGGPpKMUBPkGnPobfjsJZJiR")
+pc = Pinecone(api_key="your_api_key_for_pinecone")
 
 assistant = pc.assistant.create_assistant(
     assistant_name="example-assistant", 
