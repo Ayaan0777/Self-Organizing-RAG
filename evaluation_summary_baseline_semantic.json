@@ -1,0 +1,18 @@
+{
+  "timestamp": "2026-03-23T15:36:50.096346",
+  "config": {
+    "llm": "llama3",
+    "embedding_model": "nomic-embed-text",
+    "vector_db": "Pinecone (rag-index)",
+    "provider": "Ollama (fully local)"
+  },
+  "num_questions": 75,
+  "averages": {
+    "rouge_l": 0.0784,
+    "semantic_similarity": 0.5623,
+    "ctx_question_sim": 0.6934,
+    "ctx_ground_truth_sim": 0.5441,
+    "best_ctx_question_sim": 0.7139,
+    "best_ctx_gt_sim": 0.5753
+  }
+}

@@ -1,6 +1,6 @@
 """
 Lightweight RAG evaluation script (fully local - Ollama only).
-Metrics: Exact Match, F1 Score, ROUGE-L, Semantic Similarity (Ollama embeddings).
+Metrics: ROUGE-L, Semantic Similarity (Ollama embeddings).
 
 Run:  python run_evaluation.py
 
@@ -15,7 +15,6 @@ import string
 import csv
 import numpy as np
 import requests
-from collections import Counter
 from datetime import datetime
 
 from controllers.retrieval import answer_query
@@ -45,7 +44,7 @@ def get_embedding(text: str) -> np.ndarray:
 # LOAD DATA FROM JSON FILE
 # ──────────────────────────────────────────────
 QA_FILE = r"C:\Users\hegde\Downloads\Qun_Ans1.json"
-MAX_QUESTIONS = 30
+MAX_QUESTIONS = 75
 
 with open(QA_FILE, "r", encoding="utf-8") as f:
     raw_data = json.load(f)
@@ -70,32 +69,6 @@ def normalize(text: str) -> str:
     text = text.translate(str.maketrans("", "", string.punctuation))
     text = re.sub(r"\s+", " ", text)
     return text
-
-
-def exact_match(prediction: str, ground_truth: str) -> float:
-    """Returns 1.0 if normalised strings are identical, else 0.0."""
-    return 1.0 if normalize(prediction) == normalize(ground_truth) else 0.0
-
-
-def f1_score(prediction: str, ground_truth: str) -> float:
-    """Token-level F1 between prediction and ground truth."""
-    pred_tokens = normalize(prediction).split()
-    gt_tokens = normalize(ground_truth).split()
-
-    if not pred_tokens and not gt_tokens:
-        return 1.0
-    if not pred_tokens or not gt_tokens:
-        return 0.0
-
-    common = Counter(pred_tokens) & Counter(gt_tokens)
-    num_common = sum(common.values())
-
-    if num_common == 0:
-        return 0.0
-
-    precision = num_common / len(pred_tokens)
-    recall = num_common / len(gt_tokens)
-    return 2 * (precision * recall) / (precision + recall)
 
 
 def rouge_l(prediction: str, ground_truth: str) -> float:
@@ -209,8 +182,6 @@ for i, item in enumerate(test_data, 1):
         print(f"      Retrieved {len(retrieved_contexts)} context chunks from Pinecone")
 
         # Answer quality metrics
-        em = exact_match(answer, gt)
-        f1 = f1_score(answer, gt)
         rl = rouge_l(answer, gt)
 
         # Semantic similarity (answer vs ground truth) — local Ollama
@@ -224,14 +195,12 @@ for i, item in enumerate(test_data, 1):
             "ground_truth": gt,
             "answer": answer,
             "num_contexts": len(retrieved_contexts),
-            "exact_match": em,
-            "f1_score": f1,
             "rouge_l": rl,
             "semantic_similarity": ss,
             **ctx_sims,
         })
 
-        print(f"      EM={em:.2f}  F1={f1:.4f}  ROUGE-L={rl:.4f}  SemSim={ss:.4f}")
+        print(f"      ROUGE-L={rl:.4f}  SemSim={ss:.4f}")
         print(f"      Context->Question: avg={ctx_sims['ctx_question_sim']:.4f}  best={ctx_sims['best_ctx_question_sim']:.4f}")
         print(f"      Context->GroundTr: avg={ctx_sims['ctx_ground_truth_sim']:.4f}  best={ctx_sims['best_ctx_gt_sim']:.4f}")
 
@@ -250,8 +219,6 @@ def safe_mean(values):
     clean = [v for v in values if not (isinstance(v, float) and np.isnan(v))]
     return sum(clean) / len(clean) if clean else float("nan")
 
-avg_em = safe_mean([r["exact_match"] for r in results])
-avg_f1 = safe_mean([r["f1_score"] for r in results])
 avg_rl = safe_mean([r["rouge_l"] for r in results])
 avg_ss = safe_mean([r["semantic_similarity"] for r in results])
 avg_ctx_q = safe_mean([r["ctx_question_sim"] for r in results])
@@ -268,8 +235,6 @@ print(f"  Vector DB              : Pinecone ({settings.pinecone_index_name})")
 print(f"  Questions evaluated    : {len(results)}")
 print(f"")
 print(f"  --- Answer Quality ---")
-print(f"  Exact Match              : {avg_em:.4f}")
-print(f"  F1 Score                 : {avg_f1:.4f}")
 print(f"  ROUGE-L                  : {avg_rl:.4f}")
 print(f"  Semantic Similarity      : {avg_ss:.4f}")
 print(f"")
@@ -287,7 +252,7 @@ csv_file = "evaluation_results.csv"
 with open(csv_file, "w", newline="", encoding="utf-8") as f:
     writer = csv.DictWriter(f, fieldnames=[
         "question", "ground_truth", "answer", "num_contexts",
-        "exact_match", "f1_score", "rouge_l", "semantic_similarity",
+        "rouge_l", "semantic_similarity",
         "ctx_question_sim", "ctx_ground_truth_sim",
         "best_ctx_question_sim", "best_ctx_gt_sim"
     ])
@@ -307,8 +272,6 @@ summary = {
     },
     "num_questions": len(results),
     "averages": {
-        "exact_match": round(float(avg_em), 4),
-        "f1_score": round(float(avg_f1), 4),
         "rouge_l": round(float(avg_rl), 4),
         "semantic_similarity": round(float(avg_ss), 4),
         "ctx_question_sim": round(float(avg_ctx_q), 4),
