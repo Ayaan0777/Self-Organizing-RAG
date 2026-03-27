@@ -3,8 +3,8 @@ from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 
-def answer_query(query: str):
-    vector_store = get_vector_store()
+def answer_query(query: str,namespace: str = "default"):
+    vector_store = get_vector_store(namespace=namespace)  # <-- Pass namespace here
     retriever = vector_store.as_retriever(search_kwargs={"k": 3})
     
     prompt = ChatPromptTemplate.from_template(

@@ -7,14 +7,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from services.llm_factory import get_vector_store
 
 def clean_text(text: str) -> str:
-    """Removes newlines, tabs, and collapses multiple spaces into one."""
-    # Replace \n, \t, \r and multiple spaces with a single space
-    cleaned = re.sub(r'\s+', ' ', text)
-    # Strip leading and trailing whitespace
+    text = re.sub(r'[\t\r]+', ' ', text)
+    text = re.sub(r' {3,}', ' ', text)
+    lines = [line.strip() for line in text.split('\n')]
+    cleaned = '\n'.join(lines)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
     return cleaned.strip()
 
-def process_and_store_file(file: UploadFile):
-    print(f"\n--- 📥 STARTING INGESTION: {file.filename} ---")
+def process_and_store_file(file: UploadFile,namespace: str = "default"):
+    print(f"\n--- 📥 STARTING INGESTION: {file.filename} into namespace: {namespace} ---")
     file_extension = os.path.splitext(file.filename)[1].lower()
     
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
@@ -50,9 +51,9 @@ def process_and_store_file(file: UploadFile):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     chunks = text_splitter.split_documents(raw_documents)
     
-    print(f"🚀 Uploading {len(chunks)} cleaned chunks to Pinecone...")
-    vector_store = get_vector_store()
+    print(f"🚀 Uploading {len(chunks)} cleaned chunks to Pinecone namespace '{namespace}'...")
+    vector_store = get_vector_store(namespace=namespace)  # <-- Pass namespace here
     vector_store.add_documents(documents=chunks)
     
     print(f"🎉 SUCCESS: {file.filename} is now clean and indexed!\n")
-    return {"message": f"Successfully ingested {len(chunks)} clean chunks."}
+    return {"message": f"Successfully ingested {len(chunks)} clean chunks into namespace '{namespace}'."}
