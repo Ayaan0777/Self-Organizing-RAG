@@ -44,7 +44,7 @@ def get_embedding(text: str) -> np.ndarray:
 # LOAD DATA FROM JSON FILE
 # ──────────────────────────────────────────────
 QA_FILE = r"C:\Users\hegde\Downloads\d3.json"
-MAX_QUESTIONS = 30
+MAX_QUESTIONS = 75
 
 with open(QA_FILE, "r", encoding="utf-8") as f:
     raw_data = json.load(f)
