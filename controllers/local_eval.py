@@ -8,14 +8,15 @@ from datetime import datetime
 from fastapi import UploadFile
 
 from controllers.retrieval import answer_query
+from services.llm_factory import get_embeddings
 from config import settings
-
+embedder = get_embeddings()
 # --- Helper Functions ---
 def get_embedding(text: str) -> np.ndarray:
-    url = f"{settings.ollama_base_url}/api/embed"
-    resp = requests.post(url, json={"model": settings.embedding_model_name, "input": text[:2000]}, timeout=60)
-    resp.raise_for_status()
-    return np.array(resp.json()["embeddings"][0])
+    """Get embedding seamlessly from whatever provider is in .env"""
+    # Use LangChain's built-in embed_query method instead of raw HTTP requests!
+    vector = embedder.embed_query(text[:2000]) 
+    return np.array(vector)
 
 def normalize(text: str) -> str:
     text = text.lower().strip()
@@ -129,9 +130,10 @@ async def run_local_evaluation(file: UploadFile, namespace: str, max_questions: 
         "timestamp": datetime.now().isoformat(),
         "config": {
             "llm": settings.llm_model_name,
+            "llm_provider": settings.llm_provider,                 # <-- NEW: Dynamically grab LLM provider
             "embedding_model": settings.embedding_model_name,
+            "embedding_provider": settings.embedding_provider,     # <-- NEW: Dynamically grab Embedding provider
             "vector_db": f"Pinecone ({settings.pinecone_index_name})",
-            "provider": "Ollama (fully local)",
             "namespace_tested": namespace
         },
         "num_questions": len(results),

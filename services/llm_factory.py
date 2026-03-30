@@ -2,7 +2,7 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone
-
+from langchain_huggingface import HuggingFaceEmbeddings
 from config import settings
 
 
@@ -12,13 +12,24 @@ pc = Pinecone(api_key=settings.pinecone_api_key)
 
 def get_embeddings():
     """
-    Returns the embedding model.
-    Currently using local Ollama embeddings.
+    Returns the embedding model dynamically based on the .env provider.
     """
-    return OllamaEmbeddings(
-        model=settings.embedding_model_name,
-        base_url=settings.ollama_base_url
-    )
+    provider = getattr(settings, "embedding_provider", "ollama").lower()
+
+    if provider == "huggingface":
+        # BGE models require normalization for Cosine Similarity
+        encode_kwargs = {'normalize_embeddings': True} 
+        return HuggingFaceEmbeddings(
+            model_name=settings.embedding_model_name,
+            model_kwargs={'device': 'cpu'}, # Change to 'cuda' if you have an Nvidia GPU
+            encode_kwargs=encode_kwargs
+        )
+    else:
+        # Default back to Ollama
+        return OllamaEmbeddings(
+            model=settings.embedding_model_name,
+            base_url=settings.ollama_base_url
+        )
 
 
 def get_vector_store(namespace: str = "default"):  # <-- 1. Add namespace parameter

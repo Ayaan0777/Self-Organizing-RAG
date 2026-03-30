@@ -5,7 +5,7 @@ class Settings(BaseSettings):
 
     pinecone_api_key: str
     pinecone_index_name: str
-
+    embedding_provider: str="ollama"  
     embedding_model_name: str
     ollama_base_url: str
     llm_model_name: str
