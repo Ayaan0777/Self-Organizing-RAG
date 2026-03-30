@@ -58,7 +58,7 @@ def get_embedding(text: str) -> np.ndarray:
 # LOAD DATA FROM JSON FILE
 # ──────────────────────────────────────────────
 QA_FILE = r"C:\Users\hegde\Downloads\d3.json"
-MAX_QUESTIONS = 75
+MAX_QUESTIONS = 30
 
 with open(QA_FILE, "r", encoding="utf-8") as f:
     raw_data = json.load(f)
@@ -265,7 +265,8 @@ def run_evaluation_for_namespace(namespace_name: str):
     # ──────────────────────────────────────────────
     # SAVE DETAILED RESULTS TO CSV
     # ──────────────────────────────────────────────
-    csv_file = f"evaluation_results_{namespace_name}.csv"
+    safe_namespace = namespace_name.replace(":", "-")
+    csv_file = f"evaluation_results_{safe_namespace}.csv"
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=[
             "question", "ground_truth", "answer", "num_contexts",
@@ -297,7 +298,7 @@ def run_evaluation_for_namespace(namespace_name: str):
         }
     }
 
-    sum_file = f"evaluation_summary_{namespace_name}.json"
+    sum_file = f"evaluation_summary_{safe_namespace}.json"
     with open(sum_file, "w") as f:
         json.dump(summary, f, indent=2)
 

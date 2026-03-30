@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     ollama_base_url: str
     llm_model_name: str
 
-    llm_provider: str = "ollama"   # ← add this
+    llm_provider: str = "ollama"
 
     gemini_api_key: Optional[str] = None
 
