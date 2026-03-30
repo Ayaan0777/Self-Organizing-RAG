@@ -21,6 +21,20 @@ from controllers.retrieval import answer_query
 from config import settings
 
 # ──────────────────────────────────────────────
+# MODEL → INDEX DIMENSION MAP
+# Maps each embedding model to its Pinecone index.
+# ──────────────────────────────────────────────
+MODEL_INDEX_MAP = {
+    "all-minilm":                  "rag-index",       # 384-dim
+    "nomic-embed-text":            "rag-index-768",   # 768-dim
+    "snowflake-arctic-embed":      "rag-index-1024",  # 1024-dim
+    "snowflake-arctic-embed:335m": "rag-index-1024",
+}
+
+ACTIVE_MODEL = settings.embedding_model_name
+ACTIVE_INDEX = MODEL_INDEX_MAP.get(ACTIVE_MODEL, settings.pinecone_index_name)
+
+# ──────────────────────────────────────────────
 # OLLAMA EMBEDDING HELPER
 # ──────────────────────────────────────────────
 OLLAMA_EMBED_URL = f"{settings.ollama_base_url}/api/embed"
@@ -179,7 +193,7 @@ def run_evaluation_for_namespace(namespace_name: str):
         print(f"  [{i}/{len(test_data)}] {q[:70]}...")
 
         try:
-            rag_result = answer_query(q, namespace=namespace_name)
+            rag_result = answer_query(q, namespace=namespace_name, index_name=ACTIVE_INDEX)
             answer = rag_result["answer"]
             retrieved_contexts = rag_result["retrieved_contexts"]
 
@@ -295,8 +309,12 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         namespaces = sys.argv[1:]
     else:
-        # Default behavior: run all chunking strategies
-        namespaces = ["semantic", "recursive", "markdown", "beautifulsoup"]
-    
+        # Default: evaluate the recursive strategy for the currently active model
+        namespaces = [f"recursive-{ACTIVE_MODEL}"]
+
+    print(f"  Active model  : {ACTIVE_MODEL}")
+    print(f"  Target index  : {ACTIVE_INDEX}")
+    print(f"  Namespaces    : {namespaces}\n")
+
     for ns in namespaces:
         run_evaluation_for_namespace(ns)

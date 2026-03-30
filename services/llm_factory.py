@@ -21,12 +21,15 @@ def get_embeddings():
     )
 
 
-def get_vector_store(namespace: str = "default"):
+def get_vector_store(namespace: str = "default", index_name: str = None):
     """
     Connects to Pinecone vector store using the embedding model.
+    Optionally override the index name (e.g. rag-index-768, rag-index-1024).
+    Falls back to PINECONE_INDEX_NAME from .env if not specified.
     """
+    target_index = index_name or settings.pinecone_index_name
     return PineconeVectorStore(
-        index_name=settings.pinecone_index_name,
+        index_name=target_index,
         embedding=get_embeddings(),
         pinecone_api_key=settings.pinecone_api_key,
         namespace=namespace
