@@ -21,14 +21,15 @@ def get_embeddings():
     )
 
 
-def get_vector_store():
+def get_vector_store(namespace: str = "default"):
     """
     Connects to Pinecone vector store using the embedding model.
     """
     return PineconeVectorStore(
         index_name=settings.pinecone_index_name,
         embedding=get_embeddings(),
-        pinecone_api_key=settings.pinecone_api_key
+        pinecone_api_key=settings.pinecone_api_key,
+        namespace=namespace
     )
 
 

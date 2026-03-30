@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-03-28T01:51:39.952316",
+  "namespace": "markdown",
+  "config": {
+    "llm": "tinyllama",
+    "embedding_model": "all-minilm"
+  },
+  "num_questions": 30,
+  "averages": {
+    "rouge_l": 0.5676,
+    "semantic_similarity": 0.7673,
+    "ctx_question_sim": 0.6435,
+    "ctx_ground_truth_sim": 0.5805,
+    "best_ctx_question_sim": 0.6891,
+    "best_ctx_gt_sim": 0.719
+  }
+}
