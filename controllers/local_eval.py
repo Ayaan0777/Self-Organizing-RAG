@@ -10,11 +10,12 @@ from fastapi import UploadFile
 from controllers.retrieval import answer_query
 from services.llm_factory import get_embeddings
 from config import settings
+
 embedder = get_embeddings()
+
 # --- Helper Functions ---
 def get_embedding(text: str) -> np.ndarray:
     """Get embedding seamlessly from whatever provider is in .env"""
-    # Use LangChain's built-in embed_query method instead of raw HTTP requests!
     vector = embedder.embed_query(text[:2000]) 
     return np.array(vector)
 
@@ -50,8 +51,49 @@ def semantic_similarity(text1: str, text2: str) -> float:
     except Exception:
         return float("nan")
 
-# --- Core API Logic ---
-# --- Core API Logic ---
+# --- NEW: Context Similarity Helper ---
+def context_similarity(question: str, ground_truths: list, contexts: list) -> dict:
+    """Evaluates context relevance using local HuggingFace embeddings."""
+    if not contexts:
+        return {
+            "ctx_question_sim": float("nan"), "ctx_ground_truth_sim": float("nan"),
+            "best_ctx_question_sim": float("nan"), "best_ctx_gt_sim": float("nan"),
+        }
+    try:
+        q_emb = get_embedding(question)
+        gt_embs = [get_embedding(gt) for gt in ground_truths]
+
+        q_scores = []
+        gt_scores = []
+
+        for ctx in contexts:
+            ctx_emb = get_embedding(ctx[:2000])
+            
+            # 1. Compare context against the question
+            q_sim = float(np.dot(q_emb, ctx_emb) / (np.linalg.norm(q_emb) * np.linalg.norm(ctx_emb)))
+            q_scores.append(q_sim)
+            
+            # 2. Compare context against ALL ground truths (take the best match)
+            current_ctx_gt_sims = [
+                float(np.dot(gt_emb, ctx_emb) / (np.linalg.norm(gt_emb) * np.linalg.norm(ctx_emb)))
+                for gt_emb in gt_embs
+            ]
+            gt_scores.append(max(current_ctx_gt_sims) if current_ctx_gt_sims else 0.0)
+
+        return {
+            "ctx_question_sim": float(np.mean(q_scores)) if q_scores else 0.0,
+            "ctx_ground_truth_sim": float(np.mean(gt_scores)) if gt_scores else 0.0,
+            "best_ctx_question_sim": max(q_scores) if q_scores else 0.0,
+            "best_ctx_gt_sim": max(gt_scores) if gt_scores else 0.0,
+        }
+    except Exception as e:
+        print(f"    WARNING: Context similarity failed: {e}")
+        return {
+            "ctx_question_sim": float("nan"), "ctx_ground_truth_sim": float("nan"),
+            "best_ctx_question_sim": float("nan"), "best_ctx_gt_sim": float("nan"),
+        }
+
+
 # --- Core API Logic ---
 async def run_local_evaluation(file: UploadFile, namespace: str, max_questions: int):
     contents = await file.read()
@@ -73,7 +115,8 @@ async def run_local_evaluation(file: UploadFile, namespace: str, max_questions: 
         try:
             rag_result = answer_query(q, namespace=namespace)
             answer = rag_result["answer"]
-            num_contexts = len(rag_result.get("retrieved_contexts", []))
+            retrieved_contexts = rag_result.get("retrieved_contexts", [])
+            num_contexts = len(retrieved_contexts)
             
             rl_scores = [rouge_l(answer, gt) for gt in ground_truths]
             sem_scores = [semantic_similarity(answer, gt) for gt in ground_truths]
@@ -83,7 +126,10 @@ async def run_local_evaluation(file: UploadFile, namespace: str, max_questions: 
             valid_sem = [s for s in sem_scores if not np.isnan(s)]
             best_sem = max(valid_sem) if valid_sem else float('nan')
             
-            # --- NEW: Safely extract up to 3 ground truths for the CSV ---
+            # --- NEW: Calculate Context Similarities ---
+            ctx_sims = context_similarity(q, ground_truths, retrieved_contexts)
+            
+            # Safely extract up to 3 ground truths for the CSV
             gt_1 = ground_truths[0] if len(ground_truths) > 0 else ""
             gt_2 = ground_truths[1] if len(ground_truths) > 1 else ""
             gt_3 = ground_truths[2] if len(ground_truths) > 2 else ""
@@ -96,10 +142,11 @@ async def run_local_evaluation(file: UploadFile, namespace: str, max_questions: 
                 "answer": answer,
                 "num_contexts": num_contexts,
                 "rouge_l": best_rl,
-                "semantic_similarity": best_sem
+                "semantic_similarity": best_sem,
+                **ctx_sims # <-- Inject the 4 new metrics instantly
             })
             
-            print(f"   ✅ Done! Best ROUGE-L: {best_rl:.4f} | Best SemSim: {best_sem:.4f}")
+            print(f"   ✅ Done! Best ROUGE-L: {best_rl:.4f} | Best Ctx-GT Sim: {ctx_sims['best_ctx_gt_sim']:.4f}")
             
         except Exception as e:
             print(f"   ❌ Error on question {i}: {e}")
@@ -111,8 +158,17 @@ async def run_local_evaluation(file: UploadFile, namespace: str, max_questions: 
 
     print("\n📊 Calculating averages and saving files...")
 
-    avg_rl = sum(r["rouge_l"] for r in results) / len(results)
-    avg_ss = sum(r["semantic_similarity"] for r in results) / len(results)
+    # Safe average calculation helper
+    def safe_avg(key):
+        vals = [r.get(key, 0) for r in results if not np.isnan(r.get(key, 0))]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    avg_rl = safe_avg("rouge_l")
+    avg_ss = safe_avg("semantic_similarity")
+    avg_ctx_q = safe_avg("ctx_question_sim")
+    avg_ctx_gt = safe_avg("ctx_ground_truth_sim")
+    avg_best_ctx_q = safe_avg("best_ctx_question_sim")
+    avg_best_ctx_gt = safe_avg("best_ctx_gt_sim")
 
     # --- Generate CSV File (Updated Columns) ---
     csv_file = "evaluation_results.csv"
@@ -120,7 +176,9 @@ async def run_local_evaluation(file: UploadFile, namespace: str, max_questions: 
         writer = csv.DictWriter(f, fieldnames=[
             "question", 
             "ground_truth_1", "ground_truth_2", "ground_truth_3", 
-            "answer", "num_contexts", "rouge_l", "semantic_similarity"
+            "answer", "num_contexts", "rouge_l", "semantic_similarity",
+            "ctx_question_sim", "ctx_ground_truth_sim",        # <-- NEW
+            "best_ctx_question_sim", "best_ctx_gt_sim"         # <-- NEW
         ])
         writer.writeheader()
         writer.writerows(results)
@@ -130,16 +188,20 @@ async def run_local_evaluation(file: UploadFile, namespace: str, max_questions: 
         "timestamp": datetime.now().isoformat(),
         "config": {
             "llm": settings.llm_model_name,
-            "llm_provider": settings.llm_provider,                 # <-- NEW: Dynamically grab LLM provider
+            "llm_provider": getattr(settings, "llm_provider", "ollama"),                 
             "embedding_model": settings.embedding_model_name,
-            "embedding_provider": settings.embedding_provider,     # <-- NEW: Dynamically grab Embedding provider
+            "embedding_provider": getattr(settings, "embedding_provider", "ollama"),     
             "vector_db": f"Pinecone ({settings.pinecone_index_name})",
             "namespace_tested": namespace
         },
         "num_questions": len(results),
         "averages": {
             "rouge_l": round(float(avg_rl), 4),
-            "semantic_similarity": round(float(avg_ss), 4)
+            "semantic_similarity": round(float(avg_ss), 4),
+            "ctx_question_sim": round(float(avg_ctx_q), 4),           # <-- NEW
+            "ctx_ground_truth_sim": round(float(avg_ctx_gt), 4),      # <-- NEW
+            "best_ctx_question_sim": round(float(avg_best_ctx_q), 4), # <-- NEW
+            "best_ctx_gt_sim": round(float(avg_best_ctx_gt), 4)       # <-- NEW
         }
     }
 
