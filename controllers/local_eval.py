@@ -10,6 +10,7 @@ from fastapi import UploadFile
 from controllers.retrieval import answer_query
 from services.llm_factory import get_embeddings
 from config import settings
+from services.query_logger import log_interaction
 
 embedder = get_embeddings()
 
@@ -113,10 +114,13 @@ async def run_local_evaluation(file: UploadFile, namespace: str, max_questions: 
         print(f"⏳ Processing [{i}/{total_q}]: {q[:50]}...")
         
         try:
-            rag_result = answer_query(q, namespace=namespace)
+            # 1. ADD skip_log=True to prevent saving NULL metrics
+            rag_result = answer_query(q, namespace=namespace, skip_log=True)
+            
             answer = rag_result["answer"]
             retrieved_contexts = rag_result.get("retrieved_contexts", [])
             num_contexts = len(retrieved_contexts)
+            q_scores = rag_result.get("scores", [])  # <-- Extract the raw Pinecone scores
             
             rl_scores = [rouge_l(answer, gt) for gt in ground_truths]
             sem_scores = [semantic_similarity(answer, gt) for gt in ground_truths]
@@ -126,8 +130,28 @@ async def run_local_evaluation(file: UploadFile, namespace: str, max_questions: 
             valid_sem = [s for s in sem_scores if not np.isnan(s)]
             best_sem = max(valid_sem) if valid_sem else float('nan')
             
-            # --- NEW: Calculate Context Similarities ---
+            # Calculate Context Similarities
             ctx_sims = context_similarity(q, ground_truths, retrieved_contexts)
+            
+            # 2. PACKAGE metrics for the database
+            metrics_dict = {
+                "rouge_l": best_rl,
+                "semantic_similarity": best_sem,
+                "ctx_question_sim": ctx_sims.get("ctx_question_sim", 0.0),
+                "ctx_ground_truth_sim": ctx_sims.get("ctx_ground_truth_sim", 0.0),
+                "best_ctx_question_sim": ctx_sims.get("best_ctx_question_sim", 0.0),
+                "best_ctx_gt_sim": ctx_sims.get("best_ctx_gt_sim", 0.0)
+            }
+
+            # 3. LOG the complete interaction with the metrics
+            log_interaction(
+                namespace=namespace,
+                query=q,
+                answer=answer,
+                contexts=retrieved_contexts,
+                scores=q_scores,
+                eval_metrics=metrics_dict
+            )
             
             # Safely extract up to 3 ground truths for the CSV
             gt_1 = ground_truths[0] if len(ground_truths) > 0 else ""
@@ -143,7 +167,7 @@ async def run_local_evaluation(file: UploadFile, namespace: str, max_questions: 
                 "num_contexts": num_contexts,
                 "rouge_l": best_rl,
                 "semantic_similarity": best_sem,
-                **ctx_sims # <-- Inject the 4 new metrics instantly
+                **ctx_sims 
             })
             
             print(f"   ✅ Done! Best ROUGE-L: {best_rl:.4f} | Best Ctx-GT Sim: {ctx_sims['best_ctx_gt_sim']:.4f}")
@@ -151,6 +175,12 @@ async def run_local_evaluation(file: UploadFile, namespace: str, max_questions: 
         except Exception as e:
             print(f"   ❌ Error on question {i}: {e}")
             continue
+
+    if not results:
+        print("❌ Evaluation failed. No questions processed.")
+        return {"error": "No questions could be processed."}
+
+    print("\n📊 Calculating averages and saving files...")
 
     if not results:
         print("❌ Evaluation failed. No questions processed.")
