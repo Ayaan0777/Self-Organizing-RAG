@@ -29,6 +29,8 @@ MODEL_INDEX_MAP = {
     "nomic-embed-text":            "rag-index-768",   # 768-dim
     "snowflake-arctic-embed":      "rag-index-1024",  # 1024-dim
     "snowflake-arctic-embed:335m": "rag-index-1024",
+    "bge-large":                   "rag-index-1024",  # 1024-dim
+    "bge-large-en":                "rag-index-1024",  # 1024-dim
 }
 
 ACTIVE_MODEL = settings.embedding_model_name
@@ -193,7 +195,7 @@ def run_evaluation_for_namespace(namespace_name: str):
         print(f"  [{i}/{len(test_data)}] {q[:70]}...")
 
         try:
-            rag_result = answer_query(q, namespace=namespace_name, index_name=ACTIVE_INDEX)
+            rag_result = answer_query(q, namespace=namespace_name, index_name=ACTIVE_INDEX, ground_truth=gts[0] if gts else None)
             answer = rag_result["answer"]
             retrieved_contexts = rag_result["retrieved_contexts"]
 

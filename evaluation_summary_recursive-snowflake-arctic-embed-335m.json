@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-03-30T15:24:57.551778",
+  "timestamp": "2026-04-13T19:44:39.530702",
   "namespace": "recursive-snowflake-arctic-embed:335m",
   "config": {
     "llm": "tinyllama",
@@ -7,11 +7,11 @@
   },
   "num_questions": 30,
   "averages": {
-    "rouge_l": 0.2649,
-    "semantic_similarity": 0.8075,
-    "ctx_question_sim": 0.7951,
-    "ctx_ground_truth_sim": 0.7709,
-    "best_ctx_question_sim": 0.841,
-    "best_ctx_gt_sim": 0.8111
+    "rouge_l": 0.2361,
+    "semantic_similarity": 0.8024,
+    "ctx_question_sim": 0.7579,
+    "ctx_ground_truth_sim": 0.7539,
+    "best_ctx_question_sim": 0.774,
+    "best_ctx_gt_sim": 0.793
   }
 }

@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-04-13T19:21:15.060560",
+  "namespace": "recursive-bge-large",
+  "config": {
+    "llm": "tinyllama",
+    "embedding_model": "bge-large"
+  },
+  "num_questions": 30,
+  "averages": {
+    "rouge_l": 0.4446,
+    "semantic_similarity": 0.7732,
+    "ctx_question_sim": 0.6971,
+    "ctx_ground_truth_sim": 0.6851,
+    "best_ctx_question_sim": 0.7372,
+    "best_ctx_gt_sim": 0.7816
+  }
+}

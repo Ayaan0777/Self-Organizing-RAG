@@ -89,6 +89,24 @@ def process_and_store_file(file: UploadFile, strategy: str = "semantic", namespa
                 else:
                     chunks.extend(fallback_splitter.split_documents([chunk]))
 
+        # --- ENFORCE MINIMUM CHUNK SIZE ---
+        print("Enforcing minimum chunk size (100 chars)...")
+        MIN_CHUNK_SIZE = 100
+        merged_chunks = []
+        for chunk in chunks:
+            if not merged_chunks:
+                merged_chunks.append(chunk)
+            elif len(chunk.page_content) < MIN_CHUNK_SIZE:
+                # Merge current small chunk into the previous
+                merged_chunks[-1].page_content += "\n" + chunk.page_content
+            elif len(merged_chunks[-1].page_content) < MIN_CHUNK_SIZE:
+                # If the previous chunk was small (e.g. the very first one), merge this into it
+                merged_chunks[-1].page_content += "\n" + chunk.page_content
+            else:
+                merged_chunks.append(chunk)
+        chunks = merged_chunks
+        # ----------------------------------
+
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
@@ -148,6 +166,8 @@ if __name__ == "__main__":
         "nomic-embed-text":       "rag-index-768",    # 768-dim
         "snowflake-arctic-embed": "rag-index-1024",   # 1024-dim
         "snowflake-arctic-embed:335m": "rag-index-1024",
+        "bge-large":              "rag-index-1024",   # 1024-dim
+        "bge-large-en":           "rag-index-1024",   # 1024-dim
     }
 
     active_model = settings.embedding_model_name

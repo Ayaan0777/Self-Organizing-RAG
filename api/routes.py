@@ -6,7 +6,8 @@ router = APIRouter()
 
 class QueryReq(BaseModel):
     query: str
-    namespace:str = "default"
+    namespace: str = "default"
+    ground_truth: str = None
 
 class ClearReq(BaseModel):
     confirm: bool = False
@@ -21,7 +22,7 @@ async def ingest_endpoint(
 
 @router.post("/query")
 async def query_endpoint(req: QueryReq):
-    return retrieval.answer_query(req.query, req.namespace)
+    return retrieval.answer_query(req.query, req.namespace, ground_truth=req.ground_truth)
 
 
 @router.post("/clear")

@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-03-30T13:14:46.021609",
+  "namespace": "recursive-nomic-embed-text",
+  "config": {
+    "llm": "tinyllama",
+    "embedding_model": "nomic-embed-text"
+  },
+  "num_questions": 30,
+  "averages": {
+    "rouge_l": 0.3729,
+    "semantic_similarity": 0.7348,
+    "ctx_question_sim": 0.7249,
+    "ctx_ground_truth_sim": 0.7144,
+    "best_ctx_question_sim": 0.7708,
+    "best_ctx_gt_sim": 0.8126
+  }
+}
