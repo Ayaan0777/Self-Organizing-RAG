@@ -79,8 +79,6 @@ page = st.sidebar.radio(
     "📋 Navigate",
     ["Overview", "Query Diagnostics", "Low-Recall Events", "Eval History"],
 )
-
-
 # ══════════════════════════════════════════════════════════════════════════
 #  OVERVIEW
 # ══════════════════════════════════════════════════════════════════════════
@@ -173,8 +171,8 @@ elif page == "Query Diagnostics":
             row_data = {
                 "ID": r.id,
                 "Query": r.query[:90],
-                "Ctx↔Q Sim": round(cqs, 4) if cqs is not None else "—",
-                "Answer↔GT Sim": round(asim, 4) if asim is not None else "—",
+                "Ctx↔Q Sim": f"{cqs:.4f}" if cqs is not None else "—",
+                "Answer↔GT Sim": f"{asim:.4f}" if asim is not None else "—",
                 "Status": "⚠ Flagged" if r.flagged else "✓ OK",
                 "Latency (s)": f"{r.latency_ms / 1000:.2f}",
                 "Time": str(r.timestamp)[:19],
@@ -218,6 +216,7 @@ elif page == "Query Diagnostics":
             # LLM Answer
             st.markdown("**💬 LLM Answer:**")
             st.info(selected.llm_response or "_No response recorded_")
+
 
 
 

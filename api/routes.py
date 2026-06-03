@@ -1,6 +1,7 @@
-from fastapi import APIRouter, UploadFile, File, Query
+from fastapi import APIRouter, UploadFile, File, Query, Form
 from pydantic import BaseModel
 from controllers import ingestion, retrieval, evaluation
+from controllers.evaluation import process_local_evaluation
 
 router = APIRouter()
 
@@ -134,3 +135,16 @@ def index_refresh(namespace: str = None, sample_size: int = 50, auto_fix: bool =
     from auto_indexer.engine import AutoIndexer
     indexer = AutoIndexer(namespace)
     return indexer.run_full_refresh(sample_size=sample_size, auto_fix=auto_fix)
+
+@router.post("/evaluate-local")
+async def evaluate_local_endpoint(
+    file: UploadFile = File(...),
+    namespace: str = Form("mxbai-embed-large"),
+    max_questions: int = Form(30)
+):
+    """
+    Upload a JSON dataset to run a fully local Ollama evaluation.
+    Requires fields: 'qun' (question string) and 'ans' (list of ground truth strings).
+    """
+    return await process_local_evaluation(file, namespace, max_questions)
+

@@ -59,7 +59,17 @@ def process_and_store_file(file: UploadFile, namespace: str = None):
     vector_store = get_vector_store(namespace)
     ns_label = namespace or "default"
     print(f"🚀 Uploading {len(chunks)} cleaned chunks to Pinecone (namespace={ns_label})...")
-    vector_store.add_documents(documents=chunks)
+    
+    # --- ADD THIS BATCHING LOGIC BACK ---
+    batch_size = 50  # Safe batch size for local Ollama models
+    total_batches = (len(chunks) + batch_size - 1) // batch_size 
+    
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i : i + batch_size]
+        current_batch = (i // batch_size) + 1
+        print(f"   ⚙️ Embedding & Uploading batch {current_batch}/{total_batches}...")
+        vector_store.add_documents(documents=batch)
+    # ------------------------------------
 
     print(f"🎉 SUCCESS: {file.filename} is now clean and indexed!\n")
     return {
