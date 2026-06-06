@@ -187,3 +187,25 @@ async def trigger_repair_loop(
         
     return result
 
+
+@router.get("/eval-history")
+def get_eval_history(limit: int = 100):
+    """Returns recent evaluation snapshots for the dashboard."""
+    from db.models import EvalSnapshot
+    s = get_session()
+    rows = s.query(EvalSnapshot).order_by(EvalSnapshot.timestamp.desc()).limit(limit).all()
+    s.close()
+    return [
+        {
+            "id": r.id,
+            "namespace": r.namespace,
+            "llm": r.llm,
+            "embeddings": r.embeddings,
+            "rouge_l": r.rouge_l,
+            "sem_sim": r.sem_sim,
+            "ctx_q_sim": r.ctx_q_sim,
+            "ctx_gt_sim": r.ctx_gt_sim,
+            "timestamp": str(r.timestamp),
+        }
+        for r in rows
+    ]
