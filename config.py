@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     # Pinecone
     pinecone_api_key: str = ""
     pinecone_index_name: str = ""
-
+    pinecone_namespace: str = "" 
 
     # Ollama Embeddings
     embedding_model_name: str = "mxbai-embed-large"

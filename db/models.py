@@ -30,6 +30,8 @@ class LowRecallEvent(Base):
     severity            = Column(String(10)) # LOW | MEDIUM | HIGH
     resolved            = Column(Boolean, default=False)
     timestamp           = Column(DateTime, default=datetime.utcnow)
+    attempts = Column(Integer, default=0)
+    unfixable = Column(Boolean, default=False)
 
 
 class RepairReport(Base):

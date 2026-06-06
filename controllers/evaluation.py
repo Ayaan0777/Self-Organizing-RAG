@@ -87,22 +87,23 @@ def context_similarity(question: str, ground_truths: list, contexts: list) -> di
         }
 
 # ══════════════════════════════════════════════
-#  CORE API FUNCTION
+#  CORE API FUNCTION (CRITICAL FIX HERE)
 # ══════════════════════════════════════════════
-async def process_local_evaluation(file: UploadFile, namespace: str, max_questions: int):
+async def process_local_evaluation(file: UploadFile, namespace: str, max_questions: int, start_index: int = 0):
     # 1. Read and parse the uploaded file
     contents = await file.read()
     raw_data = json.loads(contents)
     
     test_data = []
-    for item in raw_data[:max_questions]:
+    # Clean slice using python array slicing: [start : start + length]
+    for item in raw_data[start_index : start_index + max_questions]:
         test_data.append({
             "question": item.get("qun", ""),
             "ground_truths": item.get("ans", [])
         })
 
     results = []
-    print(f"\n🚀 Starting Evaluation for namespace '{namespace}' on {len(test_data)} questions...")
+    print(f"\n🚀 Starting Evaluation for namespace '{namespace}' on {len(test_data)} questions starting at index {start_index}...")
 
     # 2. Run the RAG pipeline on each question
     for i, item in enumerate(test_data, 1):
@@ -111,6 +112,7 @@ async def process_local_evaluation(file: UploadFile, namespace: str, max_questio
         print(f"  [{i}/{len(test_data)}] Processing: {q[:50]}...")
 
         try:
+            # Execute query on the baseline RAG pipeline
             rag_result = answer_query(q, namespace=namespace)
             answer = rag_result["answer"]
             retrieved_contexts = rag_result["retrieved_contexts"]
@@ -125,6 +127,7 @@ async def process_local_evaluation(file: UploadFile, namespace: str, max_questio
                     log_id = log_id,
                     answer_sem_sim = ss,
                     ctx_q_sim = ctx_sims["ctx_question_sim"],
+                    retrieved_contexts = retrieved_contexts  # 🚀 Pass the contexts here!
                 )
             except Exception as ue:
                 print(f"      [eval] could not update log metrics: {ue}")

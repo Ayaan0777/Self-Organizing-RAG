@@ -1,8 +1,8 @@
-from fastapi import APIRouter, UploadFile, File, Query, Form
+from fastapi import APIRouter, UploadFile, File, Query, Form,HTTPException
 from pydantic import BaseModel
 from controllers import ingestion, retrieval, evaluation
 from controllers.evaluation import process_local_evaluation
-
+from repair.orchestrator import handle_event
 router = APIRouter()
 
 
@@ -92,23 +92,37 @@ def get_logs(limit: int = 50):
 
 
 @router.get("/events")
-def get_events():
-    """Returns all low-recall events ordered by most recent."""
-    s    = get_session()
-    rows = s.query(LowRecallEvent).order_by(LowRecallEvent.timestamp.desc()).all()
-    s.close()
-    return [
-        {
-            "id"       : r.id,
-            "severity" : r.severity,
-            "detectors": _json.loads(r.triggered_detectors or "[]"),
-            "resolved" : r.resolved,
-            "ts"       : str(r.timestamp),
-        }
-        for r in rows
-    ]
-
-
+async def get_events(unresolved_only: bool = True):
+    """
+    Returns a list of LowRecallEvents.
+    By default, hides events that have already been successfully repaired.
+    """
+    from db.session import get_session
+    from db.models import LowRecallEvent
+    
+    session = get_session()
+    try:
+        query = session.query(LowRecallEvent)
+        
+        # Filter out the repaired events so we only see the active "hit list"
+        if unresolved_only:
+            query = query.filter(LowRecallEvent.resolved == False)
+            
+        events = query.order_by(LowRecallEvent.timestamp.desc()).limit(100).all()
+        
+        return [
+            {
+                "id": e.id,
+                "query_log_id": e.query_log_id,
+                "severity": e.severity,
+                "detectors": e.triggered_detectors,
+                "resolved": e.resolved,
+                "timestamp": e.timestamp
+            }
+            for e in events
+        ]
+    finally:
+        session.close()
 
 
 # ── Month 4: Auto Indexer endpoints ───────────────────────────
@@ -140,11 +154,36 @@ def index_refresh(namespace: str = None, sample_size: int = 50, auto_fix: bool =
 async def evaluate_local_endpoint(
     file: UploadFile = File(...),
     namespace: str = Form("mxbai-embed-large"),
-    max_questions: int = Form(30)
+    max_questions: int = Form(30),
+    start_index: int = Form(0)
 ):
     """
     Upload a JSON dataset to run a fully local Ollama evaluation.
     Requires fields: 'qun' (question string) and 'ans' (list of ground truth strings).
     """
-    return await process_local_evaluation(file, namespace, max_questions)
+    return await process_local_evaluation(
+        file=file, 
+        namespace=namespace, 
+        max_questions=max_questions, 
+        start_index=start_index
+    )
+@router.post("/repair/{event_id}")
+async def trigger_repair_loop(
+    event_id: int,
+    strategy: str = Query("semantic", description="Strategy to use: 'semantic', 'llm', or 'entropy'")
+):
+    """
+    Triggers the self-healing repair loop for a specific LowRecallEvent.
+    1. Isolates the specific failing chunks
+    2. Re-chunks them using the chosen strategy
+    3. Replaces the old vectors in Pinecone
+    4. Probes the score to verify improvement
+    """
+    result = handle_event(event_id, strategy=strategy)
+    
+    # If the orchestrator caught a known error, return a clean 400 Bad Request
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+        
+    return result
 
