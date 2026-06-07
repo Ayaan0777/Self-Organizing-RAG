@@ -45,7 +45,7 @@ st.markdown("""
     --green:     #00ff88;
     --amber:     #ffb800;
     --red:       #ff3366;
-    --text:      #c8d8ff;
+    --text:      #ffffff;
     --muted:     #4a5280;
     --font-mono: 'JetBrains Mono', monospace;
     --font-disp: 'Orbitron', monospace;
@@ -85,16 +85,16 @@ html, body, [class*="css"], .stApp {
     font-family: var(--font-disp) !important;
     font-size: 0.85rem;
     font-weight: 900;
-    color: var(--cyan);
+    color: var(--text);
     padding: 24px 20px 8px 20px;
     letter-spacing: 3px;
-    text-shadow: 0 0 12px var(--cyan);
+    text-shadow: 0 0 12px var(--text);
 }
 [data-testid="stSidebarNav"] { display: none; }
 [data-testid="stSidebar"] .stRadio label {
     font-family: var(--font-mono) !important;
     font-size: 0.8rem !important;
-    color: var(--muted) !important;
+    color: #ffffff !important;
     letter-spacing: 1px;
     padding: 6px 0 !important;
     transition: color 0.2s;
@@ -103,7 +103,7 @@ html, body, [class*="css"], .stApp {
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
     font-family: var(--font-disp) !important;
     font-size: 0.65rem !important;
-    color: var(--muted) !important;
+    color: #a0a8cc !important;
     letter-spacing: 2px;
     text-transform: uppercase;
 }
@@ -232,7 +232,7 @@ label[data-testid="stWidgetLabel"] p {
 [data-testid="stCaptionContainer"] p {
     font-family: var(--font-mono) !important;
     font-size: 0.75rem !important;
-    color: var(--muted) !important;
+    color: #ffffff !important;
     letter-spacing: 1px;
 }
 
@@ -590,7 +590,7 @@ session = get_session()
 
 page = st.sidebar.radio(
     "NAVIGATE",
-    ["Overview", "Ingest Document", "Ask Query", "Query Diagnostics", "Low-Recall Events", "Eval History"],
+    ["Overview", "Ingest Document", "Ask Query", "Query Diagnostics", "Flagged Events", "Eval History"],
 )
 
 st.sidebar.markdown("---")
@@ -620,7 +620,6 @@ if page == "Overview":
     st.caption(f"FLAG RATE: {flag_rate}%  ·  RESOLUTION RATE: {res_rate}%")
 
     term_div()
-    sec_header("TOP-1 RETRIEVAL SCORE — TEMPORAL")
 
     all_rows = session.query(QueryLog).order_by(QueryLog.timestamp.asc()).limit(500).all()
     if all_rows:
@@ -634,8 +633,7 @@ if page == "Overview":
                     "flagged": r.flagged,
                 })
         if trend_data:
-            df_trend = pd.DataFrame(trend_data)
-            st.line_chart(df_trend.set_index("timestamp")["top1_score"], height=220)
+            
 
             col1, col2 = st.columns(2)
             with col1:
@@ -892,7 +890,6 @@ elif page == "Query Diagnostics":
             ans_text = selected.llm_response or "_no response recorded_"
             st.markdown(f"""
             <div class="answer-card">
-                <div class="answer-label">LLM OUTPUT</div>
                 <div class="answer-text">{ans_text}</div>
             </div>
             """, unsafe_allow_html=True)
@@ -952,19 +949,28 @@ elif page == "Query Diagnostics":
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  LOW-RECALL EVENTS
+#  FLAGGED EVENTS
 # ══════════════════════════════════════════════════════════════════════════
-elif page == "Low-Recall Events":
-    page_header("ANALYSIS // EVENTS", "LOW-RECALL EVENTS")
+elif page == "Flagged Events":
+    page_header("ANALYSIS // EVENTS", "FLAGGED EVENTS")
 
-    sev_filter = st.selectbox("FILTER BY SEVERITY", ["ALL", "HIGH", "MEDIUM", "LOW"])
+    col1, col2 = st.columns(2)
+    with col1:
+        sev_filter = st.selectbox("FILTER BY SEVERITY", ["ALL", "HIGH", "MEDIUM", "LOW"])
+    with col2:
+        res_filter = st.selectbox("FILTER BY RESOLVED", ["ALL", "RESOLVED", "UNRESOLVED"])
+
     q = session.query(LowRecallEvent).order_by(LowRecallEvent.timestamp.desc())
     if sev_filter != "ALL":
         q = q.filter(LowRecallEvent.severity == sev_filter)
+    if res_filter == "RESOLVED":
+        q = q.filter(LowRecallEvent.resolved == True)
+    elif res_filter == "UNRESOLVED":
+        q = q.filter(LowRecallEvent.resolved == False)
     rows = q.limit(200).all()
 
     if not rows:
-        st.success("▸ NO LOW-RECALL EVENTS — pipeline is operating nominally.")
+        st.success("▸ NO FLAGGED EVENTS — pipeline is operating nominally.")
     else:
         data = []
         for r in rows:
