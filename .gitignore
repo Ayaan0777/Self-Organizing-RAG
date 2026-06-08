@@ -1,0 +1,44 @@
+# ── Virtual Environment ──
+venv/
+.venv/
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Environment / Secrets ──
+.env
+
+# ── SQLite Database ──
+db/autorag.db
+*.db
+
+# ── IDE / Editor ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS Files ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Results / Outputs ──
+results/
+
+# ── Temporary Files ──
+*.tmp
+*.log
+
+walkthrough.md
+
+# ── Frontend ──
+frontend/node_modules/
+frontend/dist/
