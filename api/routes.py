@@ -188,6 +188,33 @@ async def trigger_repair_loop(
     return result
 
 
+@router.get("/repair-report/{event_id}")
+def get_repair_report(event_id: int):
+    """Returns the latest repair report for a LowRecallEvent."""
+    s = get_session()
+    try:
+        report = (
+            s.query(RepairReport)
+            .filter(RepairReport.event_id == event_id)
+            .order_by(RepairReport.timestamp.desc())
+            .first()
+        )
+        if not report:
+            raise HTTPException(status_code=404, detail="Repair report not found")
+
+        return {
+            "event_id": report.event_id,
+            "strategy_used": report.strategy_used,
+            "score_before": report.score_before,
+            "score_after": report.score_after,
+            "resolved": report.resolved,
+            "original_answer": report.original_answer,
+            "resolved_answer": report.resolved_answer,
+        }
+    finally:
+        s.close()
+
+
 @router.get("/eval-history")
 def get_eval_history(limit: int = 100):
     """Returns recent evaluation snapshots for the dashboard."""

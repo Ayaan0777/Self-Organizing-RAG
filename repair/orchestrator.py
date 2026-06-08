@@ -18,6 +18,7 @@ from db.session import get_session
 from db.models import LowRecallEvent, QueryLog, RepairReport
 from repair.chunker import rechunk_semantic, rechunk_llm, rechunk_entropy
 from repair.reembedder import reembed
+from controllers.retrieval import generate_answer_only
 from services.llm_factory import get_vector_store, get_pinecone_index, get_embeddings
 from config import settings
 
@@ -128,6 +129,11 @@ def handle_event(event_id: int, strategy: str = "semantic") -> dict:
         # Probe: did the repair actually improve recall?
         score_after = _probe_score(log.query)
         improved    = score_after > score_before + 0.05
+        resolved_answer = None
+
+        if improved:
+            repaired_result = generate_answer_only(log.query)
+            resolved_answer = repaired_result.get("answer")
 
         # Persist repair report
         report = RepairReport(
@@ -138,6 +144,8 @@ def handle_event(event_id: int, strategy: str = "semantic") -> dict:
             score_before  = round(score_before, 4),
             score_after   = round(score_after, 4),
             resolved      = improved,
+            original_answer = log.llm_response,
+            resolved_answer = resolved_answer,
             duration_ms   = int((time.time() - t0) * 1000),
         )
         event.resolved = improved

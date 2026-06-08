@@ -45,6 +45,8 @@ class RepairReport(Base):
     score_before  = Column(Float)
     score_after   = Column(Float)
     resolved      = Column(Boolean, default=False)
+    original_answer = Column(Text, nullable=True)
+    resolved_answer = Column(Text, nullable=True)
     duration_ms   = Column(Integer)
     timestamp     = Column(DateTime, default=datetime.utcnow)
 

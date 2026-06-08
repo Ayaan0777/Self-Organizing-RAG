@@ -985,6 +985,37 @@ elif page == "Flagged Events":
                 "Time":      str(r.timestamp)[:19],
             })
         render_table(pd.DataFrame(data))
+
+        term_div()
+        sec_header("REPAIR REPORT")
+        event_options = {f"EVENT #{r.id} - QUERY LOG #{r.query_log_id}": r.id for r in rows}
+        selected_event_label = st.selectbox("SELECT EVENT", list(event_options.keys()))
+        selected_event_id = event_options[selected_event_label]
+
+        try:
+            report_resp = requests.get(f"{API_BASE}/repair-report/{selected_event_id}", timeout=30)
+            if report_resp.status_code == 200:
+                report = report_resp.json()
+
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("STRATEGY USED", report.get("strategy_used") or "N/A")
+                col2.metric("SCORE BEFORE", report.get("score_before") if report.get("score_before") is not None else "N/A")
+                col3.metric("SCORE AFTER", report.get("score_after") if report.get("score_after") is not None else "N/A")
+                col4.metric("RESOLVED STATUS", "YES" if report.get("resolved") else "NO")
+
+                st.text_area("ORIGINAL ANSWER", value=report.get("original_answer") or "", height=180, disabled=True)
+                st.text_area("RESOLVED ANSWER", value=report.get("resolved_answer") or "", height=180, disabled=True)
+            elif report_resp.status_code == 404:
+                st.info("NO REPAIR REPORT FOUND FOR THIS EVENT")
+            else:
+                st.error(f"REPAIR REPORT FAILED - HTTP {report_resp.status_code}")
+                st.code(report_resp.text)
+        except requests.ConnectionError:
+            st.error("CONNECTION ERROR - backend unreachable")
+        except requests.Timeout:
+            st.error("TIMEOUT - repair report request took too long")
+        except Exception as e:
+            st.error(f"ERROR - {e}")
 # ══════════════════════════════════════════════════════════════════════════
 elif page == "Eval History":
     page_header("ANALYSIS // EVAL", "EVALUATION HISTORY")
