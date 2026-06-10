@@ -1,88 +1,178 @@
-import json
+"""
+Repair Chunker — SH2: Adaptive Strategy
+=========================================
+Single adaptive rechunking function whose parameters are chosen by
+the DECIDE stage in the orchestrator, based on the failure pattern.
+
+Chunk sizes are always DIFFERENT from ingestion (1250/200) to actually
+fix the problem. The DECIDE logic selects:
+  - context_insufficient → chunk_size=1500 (more context per chunk)
+  - hallucination_detected → chunk_size=400 (less noise, more precise)
+  - complex query failure → chunk_size=1500
+  - simple query failure → chunk_size=400
+  - default → chunk_size=800
+
+All sizes are within mxbai-embed-large's 512-token context window:
+  - 1800 chars = ~450 tokens (safe max)
+  - 400 chars = ~100 tokens
+"""
+import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from services.llm_factory import get_llm
+
+# ── Repair-specific separators (same hierarchy as ingestion) ────────
+SEPARATORS = ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]
 
 
-def rechunk_semantic(text: str, source: str) -> list[Document]:
+def _enforce_min_size(chunks: list[Document], min_chars: int = 150) -> list[Document]:
     """
-    Strategy A — Smaller chunks with more overlap.
-    Best default. Use when top score is low but chunks look vaguely relevant.
-    Produces chunks of ~250 chars with 80-char overlap.
+    Merges chunks smaller than min_chars with their neighbor.
+    Uses a slightly lower floor than ingestion (150 vs 200) since repair
+    chunks may intentionally be smaller for precision.
     """
+    if len(chunks) <= 1:
+        return chunks
+
+    result = []
+    buffer = chunks[0]
+
+    for chunk in chunks[1:]:
+        if len(buffer.page_content) < min_chars:
+            buffer = Document(
+                page_content=buffer.page_content + " " + chunk.page_content,
+                metadata={**buffer.metadata, **chunk.metadata},
+            )
+        else:
+            result.append(buffer)
+            buffer = chunk
+
+    if result and len(buffer.page_content) < min_chars:
+        last = result.pop()
+        buffer = Document(
+            page_content=last.page_content + " " + buffer.page_content,
+            metadata={**last.metadata, **buffer.metadata},
+        )
+    result.append(buffer)
+    return result
+
+
+def rechunk_adaptive(
+    text: str,
+    source: str,
+    chunk_size: int,
+    overlap: int,
+    repair_reason: str = "default_repair",
+) -> list[Document]:
+    """
+    Adaptive repair chunking — parameters chosen by the DECIDE stage.
+    NEVER uses the same params as ingestion (1250/200) to ensure the
+    repair actually changes the chunk boundaries.
+
+    Args:
+        text:          Full text of the source document / concatenated chunks.
+        source:        Source identifier for metadata.
+        chunk_size:    Chunk size selected by DECIDE stage.
+        overlap:       Overlap selected by DECIDE stage.
+        repair_reason: Why this chunk size was chosen (for logging/audit).
+
+    Returns:
+        List of LangChain Documents with repair metadata.
+    """
+    if not text or not text.strip():
+        return []
+
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size    = 250,
-        chunk_overlap = 80,
-        separators    = ["\n\n", "\n", ". ", "? ", "! ", " ", ""],
-    )
-    return splitter.create_documents(
-        [text], metadatas=[{"source": source, "strategy": "semantic"}]
+        chunk_size=chunk_size,
+        chunk_overlap=overlap,
+        separators=SEPARATORS,
+        length_function=len,
     )
 
-
-def rechunk_llm(text: str, source: str) -> list[Document]:
-    """
-    Strategy B — Ask the LLM to find topic boundaries, split there.
-    Use when content mixes multiple distinct topics in one document.
-    Falls back to rechunk_semantic on any parse failure.
-    """
-    llm    = get_llm()
-    prompt = (
-        "Identify natural topic-boundary sentence indices in the text below. "
-        "Return ONLY a JSON array of integers — the 0-indexed sentence numbers "
-        "where a new topic begins. Example output: [3, 7, 12]\n\nText:\n"
-        + text[:3000]
+    chunks = splitter.create_documents(
+        [text],
+        metadatas=[{
+            "source": source,
+            "strategy": "adaptive_repair",
+            "repair_chunk_size": chunk_size,
+            "repair_reason": repair_reason,
+        }],
     )
-    try:
-        raw        = llm.invoke(prompt).content.strip()
-        split_idxs = set(json.loads(raw))
-        sentences  = [s.strip() for s in text.replace(". ", ".|").split("|") if s.strip()]
-        chunks, buf = [], []
-        for i, sent in enumerate(sentences):
-            buf.append(sent)
-            if i in split_idxs and buf:
-                chunks.append(Document(
-                    page_content = " ".join(buf),
-                    metadata     = {"source": source, "strategy": "llm"},
-                ))
-                buf = []
-        if buf:
-            chunks.append(Document(
-                page_content = " ".join(buf),
-                metadata     = {"source": source, "strategy": "llm"},
-            ))
-        return chunks if len(chunks) > 1 else rechunk_semantic(text, source)
-    except Exception:
-        return rechunk_semantic(text, source)
+
+    # Enforce minimum size
+    min_floor = 100 if chunk_size <= 400 else 150
+    chunks = _enforce_min_size(chunks, min_chars=min_floor)
+
+    return chunks
 
 
-def rechunk_entropy(text: str, source: str) -> list[Document]:
+# ── DECIDE stage: strategy selection based on failure pattern ───────
+
+def _analyse_query_type(query: str) -> str:
     """
-    Strategy C — Split at sentences with high vocabulary novelty (topic shifts).
-    Use when content is long and topics drift gradually without clear headings.
-    Falls back to rechunk_semantic if fewer than 2 chunks produced.
+    Classifies query complexity using regex heuristics.
+    Reuses the same logic as dynamic_k._analyse_query_complexity()
+    but returns a simpler label.
+
+    Returns: "complex", "simple", or "medium"
     """
-    sentences          = [s.strip() for s in text.replace("\n", " ").split(". ") if s.strip()]
-    vocab, chunks, buf = set(), [], []
+    q = query.lower().strip()
 
-    for sent in sentences:
-        words     = set(sent.lower().split())
-        new_words = words - vocab
-        novelty   = len(new_words) / max(len(words), 1)
-        vocab    |= words
+    # Comparison / multi-part → complex
+    complex_patterns = [
+        r"\bcompare\b", r"\bdifference\b", r"\bvs\.?\b", r"\bversus\b",
+        r"\band\b.*\band\b", r"\bboth\b", r"\beach\b", r"\ball\b",
+        r"\badvantages\b.*\bdisadvantages\b", r"\bpros\b.*\bcons\b",
+        r"\bexplain\b", r"\bdescribe\b", r"\boverview\b", r"\bsummar",
+        r"\bwhat are\b", r"\blist\b", r"\bdetail\b", r"\bdiscuss\b",
+    ]
+    if any(re.search(p, q) for p in complex_patterns):
+        return "complex"
 
-        if novelty > 0.6 and buf:   # high novelty = topic shift = start new chunk
-            chunks.append(Document(
-                page_content = ". ".join(buf),
-                metadata     = {"source": source, "strategy": "entropy"},
-            ))
-            buf = []
-        buf.append(sent)
+    if q.count("?") >= 2:
+        return "complex"
 
-    if buf:
-        chunks.append(Document(
-            page_content = ". ".join(buf),
-            metadata     = {"source": source, "strategy": "entropy"},
-        ))
+    # Specific factual → simple
+    simple_patterns = [
+        r"\bwho\b", r"\bwhen\b", r"\bwhere\b",
+        r"\bhow (?:much|many|old|long|far)\b",
+        r"\bwhat (?:year|date|time|number|name|city|country)\b",
+        r"\bwhich\b", r"\bdefine\b",
+    ]
+    if any(re.search(p, q) for p in simple_patterns):
+        return "simple"
 
-    return chunks if len(chunks) > 1 else rechunk_semantic(text, source)
+    # Long queries → complex
+    if len(q.split()) >= 15:
+        return "complex"
+
+    return "medium"
+
+
+def select_repair_params(query: str, detectors_triggered: list[str]) -> dict:
+    """
+    Mentor's DECIDE stage — selects chunk parameters for repair based on
+    the failure pattern (which detectors triggered) and query complexity.
+
+    The repair ALWAYS uses different params than ingestion (1250/200).
+
+    Returns:
+        dict with: chunk_size, overlap, reason
+    """
+    # Priority 1: Detector-based decisions (most specific signal)
+    if "context_insufficient" in detectors_triggered:
+        return {"chunk_size": 1500, "overlap": 300, "reason": "increase_context"}
+
+    if "hallucination_detected" in detectors_triggered:
+        return {"chunk_size": 400, "overlap": 80, "reason": "reduce_noise"}
+
+    # Priority 2: Query-complexity-based decisions
+    query_type = _analyse_query_type(query)
+
+    if query_type == "complex":
+        return {"chunk_size": 1500, "overlap": 300, "reason": "complex_query"}
+
+    if query_type == "simple":
+        return {"chunk_size": 400, "overlap": 80, "reason": "simple_query"}
+
+    # Default: medium adjustment (still different from ingestion's 1250/200)
+    return {"chunk_size": 800, "overlap": 150, "reason": "default_repair"}

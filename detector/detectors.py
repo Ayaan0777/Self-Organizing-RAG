@@ -1,138 +1,176 @@
 """
-Low Recall Detector — Month 2 Prototype
-========================================
-6 detection rules, each independent and non-blocking:
+Low Recall Detector — SH2: Mentor's 3 Metrics
+===============================================
+Detection rules based on mentor's MEASURE stage:
 
-  Existing (Month 1):
-    1. low_top_score      — Top-1 retrieval score below threshold
-    2. score_drop         — Large gap between rank-1 and rank-K
-    3. llm_uncertainty    — LLM response contains hedging language
+  1. Retrieval Precision — proportion of top-k chunks that are relevant
+  2. Context Sufficiency — LLM judges if context can fully answer the query
+  3. Hallucination Rate  — LLM checks if answer is grounded in context
 
-  New (Month 2):
-    4. semantic_mismatch  — Retrieved chunks are semantically fragmented
-    5. evidence_mismatch  — LLM answer doesn't match retrieved evidence
-    6. user_frustration   — User reformulated a similar query recently
+These detector names feed directly into the DECIDE stage (repair/orchestrator.py)
+to select the appropriate repair strategy:
+  - "low_retrieval_precision" → uses query-complexity-based chunk sizing
+  - "context_insufficient"   → increases chunk size (more context)
+  - "hallucination_detected" → decreases chunk size (less noise)
 """
 import json
-import numpy as np
-from datetime import datetime, timedelta
+import logging
 
 from db.session import get_session
 from db.models import QueryLog, LowRecallEvent
 
-# ── Detection thresholds — tune after observing real query scores ──
-SCORE_LOW          = 0.45   # rule 1: top-1 score below this → flag
-SCORE_DROP         = 0.3    # rule 2: gap rank-1 to rank-K above this → flag
-CHUNK_COHERENCE    = 0.55   # rule 4: mean pairwise chunk sim below this → flag
-EVIDENCE_MATCH     = 0.50   # rule 5: answer↔evidence sim below this → flag
-FRUSTRATION_SIM    = 0.85   # rule 6: cosine sim threshold for "same query"
-FRUSTRATION_WINDOW = 300    # rule 6: seconds to look back for reformulations
+# ── Detection thresholds ───────────────────────────────────────────
+RELEVANCE_SCORE_FLOOR = 0.45    # chunks below this are considered irrelevant
+MIN_PRECISION_RATIO   = 0.50    # at least 50% of top-k chunks must be relevant
+TOP_SCORE_FLOOR       = 0.55    # if best chunk score is below this, retrieval failed
 
-UNCERTAINTY_PHRASES = [
-    "i don't know", "i'm not sure", "cannot find", "no information",
-    "not available", "i cannot", "unclear", "no relevant", "don't have",
-    "unable to find", "no context", "not enough information",
+# ── LLM uncertainty phrases ────────────────────────────────────────
+# If the LLM's own answer contains these, the context was clearly insufficient.
+_UNCERTAINTY_PHRASES = [
+    "does not mention", "doesn't mention",
+    "no information", "not found in",
+    "context does not", "context doesn't",
+    "not mentioned", "no relevant",
+    "cannot answer", "unable to answer",
+    "not provided", "not available in",
+    "no data", "outside the scope",
 ]
 
 
-def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity between two vectors."""
-    norm = np.linalg.norm(a) * np.linalg.norm(b)
-    if norm == 0:
-        return 0.0
-    return float(np.dot(a, b) / norm)
-
-
-def _get_embeddings_model():
+def _get_llm():
     """Lazy import to avoid circular deps at module load time."""
-    from services.llm_factory import get_embeddings
-    return get_embeddings()
+    from services.llm_factory import get_llm
+    return get_llm()
 
 
-def _detect_semantic_mismatch(chunks: list[str]) -> bool:
+def _check_retrieval_precision(scores: list[float]) -> bool:
     """
-    Rule 4 — Semantic Mismatch Detector
-    Checks whether the top-K retrieved chunks are semantically coherent.
-    If chunks are about wildly different topics (low mean pairwise similarity),
-    retrieval is fragmented and the LLM gets confused context.
+    Metric 1 — Retrieval Precision
+    Two checks:
+      a) Proportion of top-k chunks with score >= 0.45 must be >= 50%
+      b) The BEST chunk score must be >= 0.55 (absolute floor)
+
+    If the best score is only ~0.49 (like for irrelevant queries),
+    that alone means the retrieval completely failed.
+
+    Returns True if precision is LOW (should flag).
     """
-    if len(chunks) < 2:
+    if not scores:
+        return True  # no scores = definitely bad retrieval
+
+    # Check a: absolute top-score floor
+    if max(scores) < TOP_SCORE_FLOOR:
+        return True  # best chunk is below 0.55 — retrieval failed
+
+    # Check b: proportion of relevant chunks
+    relevant_count = sum(1 for s in scores if s >= RELEVANCE_SCORE_FLOOR)
+    precision = relevant_count / len(scores)
+    return precision < MIN_PRECISION_RATIO
+
+
+def _check_llm_uncertainty(answer: str) -> bool:
+    """
+    Quick keyword check — if the LLM's own answer admits the context
+    is missing or irrelevant, that's a clear signal of bad retrieval.
+    No extra LLM call needed.
+
+    Returns True if uncertainty is DETECTED (should flag).
+    """
+    if not answer:
         return False
+    answer_lower = answer.lower()
+    return any(phrase in answer_lower for phrase in _UNCERTAINTY_PHRASES)
+
+
+def _check_context_sufficiency(query: str, chunks: list[str]) -> bool:
+    """
+    Metric 2 — Context Sufficiency (Lenient)
+    Uses the LLM to judge whether the retrieved context contains enough
+    information to produce a reasonable answer to the question.
+
+    NOTE: We only flag when the context is clearly MISSING key information.
+    For broad questions like "explain about X", if the context contains
+    relevant facts about X, that's sufficient — it doesn't need to cover
+    every possible aspect.
+
+    Returns True if context is INSUFFICIENT (should flag).
+    """
+    if not chunks:
+        return True  # no context = definitely insufficient
+
     try:
-        emb_model = _get_embeddings_model()
-        embeddings = [np.array(emb_model.embed_query(c[:500])) for c in chunks]
+        llm = _get_llm()
+        context_text = "\n---\n".join(c[:500] for c in chunks[:5])
 
-        sims = []
-        for i in range(len(embeddings)):
-            for j in range(i + 1, len(embeddings)):
-                sims.append(_cosine_sim(embeddings[i], embeddings[j]))
+        prompt = (
+            f"Question: {query}\n\n"
+            f"Retrieved Context:\n{context_text}\n\n"
+            "Does the context above contain RELEVANT information to answer "
+            "this question? The context doesn't need to cover every aspect — "
+            "just enough key facts to produce a useful answer.\n"
+            "Reply 'NO' ONLY if the context is completely irrelevant or "
+            "missing critical information needed to answer the question at all.\n"
+            "Reply 'YES' if the context has at least some relevant facts.\n"
+            "Reply with ONLY 'YES' or 'NO'."
+        )
+        result = llm.invoke(prompt).content.strip().upper()
+        return "NO" in result
+    except Exception as e:
+        logging.warning(f"[detector] context sufficiency check failed: {e}")
+        return False  # fail-safe: don't flag on LLM errors
 
-        mean_sim = np.mean(sims) if sims else 1.0
-        return float(mean_sim) < CHUNK_COHERENCE
-    except Exception:
-        return False
 
-
-def _detect_evidence_mismatch(answer: str, chunks: list[str]) -> bool:
+def _check_hallucination(answer: str, chunks: list[str]) -> bool:
     """
-    Rule 5 — LLM Response–Evidence Mismatch Detector
-    Compares the LLM's answer embedding against the concatenated evidence.
-    If the answer is semantically far from the evidence, the LLM may be
-    hallucinating or answering from parametric knowledge instead of context.
+    Metric 3 — Hallucination Rate (Lenient)
+    Uses the LLM to check whether the generated answer CONTRADICTS or
+    contains WRONG information compared to the retrieved context.
+
+    NOTE: We intentionally allow the LLM to add supplementary information
+    from its knowledge (e.g., naming an institution) as long as it doesn't
+    contradict the context. Only flag outright fabrication or wrong facts.
+
+    Returns True if hallucination is DETECTED (should flag).
     """
     if not answer or not chunks:
-        return False
+        return False  # nothing to check
+
     try:
-        emb_model = _get_embeddings_model()
-        answer_emb = np.array(emb_model.embed_query(answer[:500]))
-        evidence_text = " ".join(chunks)[:1000]
-        evidence_emb = np.array(emb_model.embed_query(evidence_text))
+        llm = _get_llm()
+        context_text = "\n---\n".join(c[:500] for c in chunks[:5])
 
-        sim = _cosine_sim(answer_emb, evidence_emb)
-        return sim < EVIDENCE_MATCH
-    except Exception:
-        return False
-
-
-def _detect_user_frustration(query: str, session) -> bool:
-    """
-    Rule 6 — User Frustration Signal Detector
-    Checks if a semantically similar query was asked within the last N seconds.
-    Repeated/reformulated queries indicate the user is unsatisfied with results.
-    """
-    try:
-        cutoff = datetime.utcnow() - timedelta(seconds=FRUSTRATION_WINDOW)
-        recent = session.query(QueryLog).filter(
-            QueryLog.timestamp >= cutoff
-        ).order_by(QueryLog.timestamp.desc()).limit(20).all()
-
-        if len(recent) < 2:
-            return False
-
-        emb_model = _get_embeddings_model()
-        query_emb = np.array(emb_model.embed_query(query[:500]))
-
-        # Compare against recent queries (skip the current one, which is the most recent)
-        for row in recent[1:]:
-            prev_emb = np.array(emb_model.embed_query(row.query[:500]))
-            sim = _cosine_sim(query_emb, prev_emb)
-            if sim >= FRUSTRATION_SIM:
-                return True
-
-        return False
-    except Exception:
-        return False
+        prompt = (
+            f"Retrieved Context:\n{context_text}\n\n"
+            f"Generated Answer:\n{answer}\n\n"
+            "Does the answer contain any information that CONTRADICTS or is "
+            "FACTUALLY WRONG compared to the context above? "
+            "Ignore any additional details the answer adds that don't conflict "
+            "with the context — only flag if the answer says something that the "
+            "context explicitly disagrees with or if the answer fabricates specific "
+            "facts (dates, numbers, names) that are wrong.\n"
+            "Reply with ONLY 'YES' if there are contradictions/wrong facts, "
+            "or 'NO' if the answer is consistent with the context."
+        )
+        result = llm.invoke(prompt).content.strip().upper()
+        return "YES" in result
+    except Exception as e:
+        logging.warning(f"[detector] hallucination check failed: {e}")
+        return False  # fail-safe
 
 
 def run_detectors(log_id: int):
     """
-    Runs all 6 detection rules against a freshly logged query.
-    Writes a LowRecallEvent if any rules trigger. Marks the QueryLog row as flagged.
+    Runs mentor's 3 detection metrics against a freshly logged query.
+    Writes a LowRecallEvent if any metric triggers. Marks QueryLog as flagged.
     Called automatically at the end of answer_query() in controllers/retrieval.py.
-    Silent on failure — never raises, never blocks the API response.
+
+    Detector tags written to LowRecallEvent.triggered_detectors:
+      - "low_retrieval_precision" → DECIDE uses query-complexity chunk sizing
+      - "context_insufficient"   → DECIDE increases chunk size
+      - "hallucination_detected" → DECIDE decreases chunk size
     """
     if log_id < 0:
-        return  # upstream logging failed, nothing to detect on
+        return  # upstream logging failed
 
     session = get_session()
     try:
@@ -141,36 +179,29 @@ def run_detectors(log_id: int):
             return
 
         scores   = json.loads(log.top_k_scores or "[]")
-        response = (log.llm_response or "").lower().strip()
+        answer   = (log.llm_response or "").strip()
         chunks   = json.loads(log.retrieved_chunks or "[]") if log.retrieved_chunks else []
         triggered = []
 
-        # Rule 1 — Top retrieval score is below acceptable threshold
-        if scores and scores[0] < SCORE_LOW:
-            triggered.append("low_top_score")
+        # Metric 1 — Retrieval Precision (score ratio + absolute floor)
+        if _check_retrieval_precision(scores):
+            triggered.append("low_retrieval_precision")
 
-        # Rule 2 — Big drop between rank-1 and rank-K (retrieval is inconsistent)
-        if len(scores) >= 2 and (scores[0] - scores[-1]) > SCORE_DROP:
-            triggered.append("score_drop")
+        # Metric 2 — Context Sufficiency (LLM-based)
+        if _check_context_sufficiency(log.query, chunks):
+            triggered.append("context_insufficient")
 
-        # Rule 3 — LLM response contains uncertainty / hedging language
-        if any(phrase in response for phrase in UNCERTAINTY_PHRASES):
-            triggered.append("llm_uncertainty")
+        # Metric 3 — Hallucination Rate (LLM-based)
+        if _check_hallucination(answer, chunks):
+            triggered.append("hallucination_detected")
 
-        # Rule 4 — Retrieved chunks are semantically fragmented
-        if chunks and _detect_semantic_mismatch(chunks):
-            triggered.append("semantic_mismatch")
-
-        # Rule 5 — LLM answer doesn't match the retrieved evidence
-        if chunks and _detect_evidence_mismatch(log.llm_response or "", chunks):
-            triggered.append("evidence_mismatch")
-
-        # Rule 6 — User seems to be re-asking the same thing (frustration)
-        if _detect_user_frustration(log.query, session):
-            triggered.append("user_frustration")
+        # Bonus — LLM self-admitted uncertainty (fast keyword check)
+        if _check_llm_uncertainty(answer):
+            if "context_insufficient" not in triggered:
+                triggered.append("context_insufficient")
 
         if not triggered:
-            return  # healthy query, nothing to do
+            return  # healthy query
 
         severity = {1: "LOW", 2: "MEDIUM"}.get(len(triggered), "HIGH")
 
@@ -183,10 +214,10 @@ def run_detectors(log_id: int):
         log.flagged = True
         session.add(event)
         session.commit()
-        print(f"[detector] ⚠ event={event.id} severity={severity} triggers={triggered}")
+        logging.info(f"[detector] ⚠ event={event.id} severity={severity} triggers={triggered}")
 
     except Exception as e:
         session.rollback()
-        print(f"[detector] non-fatal warning: {e}")
+        logging.warning(f"[detector] non-fatal warning: {e}")
     finally:
         session.close()

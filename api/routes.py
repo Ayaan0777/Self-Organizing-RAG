@@ -9,6 +9,9 @@ router = APIRouter()
 class QueryReq(BaseModel):
     query: str
     namespace: str = None
+    k: int = 5                        # Phase 2: dynamic top-K
+    rerank: bool = True                # Phase 2: LLM reranking
+    metadata_filter: dict = None       # Phase 2: metadata filtering
 
 
 class EvalReq(BaseModel):
@@ -27,7 +30,13 @@ async def ingest_endpoint(
 
 @router.post("/query")
 async def query_endpoint(req: QueryReq):
-    return retrieval.answer_query(req.query, req.namespace)
+    return retrieval.answer_query(
+        query=req.query,
+        namespace=req.namespace,
+        k=req.k,
+        rerank=req.rerank,
+        metadata_filter=req.metadata_filter,
+    )
 
 
 @router.post("/evaluate")
@@ -35,25 +44,29 @@ async def eval_endpoint(req: EvalReq):
     return evaluation.calculate_metrics(req.question, req.ground_truth)
 
 
-# ── Auto-Chunker endpoint ─────────────────────────────────────
+# ── Add Chunks endpoint ───────────────────────────────────────
 class AutoChunkReq(BaseModel):
     text: str
     source: str = "manual"
-    strategy: str = "semantic"       # "semantic" or "clustering"
     ingest: bool = False             # if True, also upload to Pinecone
     namespace: str = None
 
 
 @router.post("/auto-chunk")
 async def auto_chunk_endpoint(req: AutoChunkReq):
-    """Runs the auto-chunker pipeline. Optionally ingests results to Pinecone."""
+    """Chunks raw text using recursive splitting. Optionally ingests to Pinecone."""
     from auto_chunker import auto_chunk
-    chunks = auto_chunk(req.text, req.source, strategy=req.strategy)
+    chunks = auto_chunk(req.text, req.source)
 
+    sizes = [len(c.page_content) for c in chunks]
     result = {
-        "strategy": req.strategy,
+        "strategy": "recursive",
         "num_chunks": len(chunks),
-        "chunks": [{"content": c.page_content[:200], "chars": len(c.page_content)} for c in chunks],
+        "size_range": f"{min(sizes)}-{max(sizes)}" if sizes else "0",
+        "chunks": [
+            {"content": c.page_content[:300], "chars": len(c.page_content)}
+            for c in chunks
+        ],
     }
 
     if req.ingest:
@@ -168,24 +181,46 @@ async def evaluate_local_endpoint(
         start_index=start_index
     )
 @router.post("/repair/{event_id}")
-async def trigger_repair_loop(
-    event_id: int,
-    strategy: str = Query("semantic", description="Strategy to use: 'semantic', 'llm', or 'entropy'")
-):
+async def trigger_repair_loop(event_id: int):
     """
     Triggers the self-healing repair loop for a specific LowRecallEvent.
-    1. Isolates the specific failing chunks
-    2. Re-chunks them using the chosen strategy
-    3. Replaces the old vectors in Pinecone
-    4. Probes the score to verify improvement
+    Strategy is auto-selected by the DECIDE stage based on:
+      - Which detectors triggered (context_insufficient, hallucination_detected)
+      - Query complexity (complex → bigger chunks, simple → smaller chunks)
+    Includes rollback: if repair doesn't improve, old chunks are restored.
     """
-    result = handle_event(event_id, strategy=strategy)
-    
-    # If the orchestrator caught a known error, return a clean 400 Bad Request
+    result = handle_event(event_id)
+
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
-        
+
     return result
+
+
+@router.get("/repair-reports")
+def get_repair_reports(limit: int = 100):
+    """Returns repair history for the dashboard — shows all repair attempts."""
+    s = get_session()
+    rows = s.query(RepairReport).order_by(RepairReport.timestamp.desc()).limit(limit).all()
+    s.close()
+    return [
+        {
+            "id":             r.id,
+            "event_id":       r.event_id,
+            "strategy":       r.strategy_used,
+            "chunk_size":     r.chunk_size_used,
+            "repair_reason":  r.repair_reason,
+            "score_before":   r.score_before,
+            "score_after":    r.score_after,
+            "chunks_before":  r.chunks_before,
+            "chunks_after":   r.chunks_after,
+            "resolved":       r.resolved,
+            "rolled_back":    r.rolled_back,
+            "duration_ms":    r.duration_ms,
+            "timestamp":      str(r.timestamp),
+        }
+        for r in rows
+    ]
 
 
 @router.get("/eval-history")
@@ -209,3 +244,11 @@ def get_eval_history(limit: int = 100):
         }
         for r in rows
     ]
+
+
+# ── Phase 4: Feedback Analysis endpoint ───────────────────────
+@router.get("/feedback/analysis")
+def feedback_analysis():
+    """Returns a comprehensive analysis of detection + repair effectiveness."""
+    from organiser.feedback import analyse_system_health
+    return analyse_system_health()

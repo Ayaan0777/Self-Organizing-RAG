@@ -37,16 +37,19 @@ class LowRecallEvent(Base):
 class RepairReport(Base):
     """Written by repair/orchestrator.py after each repair attempt."""
     __tablename__ = "autorag_repair_reports"
-    id            = Column(Integer, primary_key=True)
-    event_id      = Column(Integer)
-    strategy_used = Column(String(50))   # semantic | llm | entropy
-    chunks_before = Column(Integer)
-    chunks_after  = Column(Integer)
-    score_before  = Column(Float)
-    score_after   = Column(Float)
-    resolved      = Column(Boolean, default=False)
-    duration_ms   = Column(Integer)
-    timestamp     = Column(DateTime, default=datetime.utcnow)
+    id              = Column(Integer, primary_key=True)
+    event_id        = Column(Integer)
+    strategy_used   = Column(String(50))    # e.g. "increase_context", "reduce_noise"
+    chunk_size_used = Column(Integer)       # the chunk_size param used for repair
+    repair_reason   = Column(String(100))   # why this strategy was chosen
+    chunks_before   = Column(Integer)
+    chunks_after    = Column(Integer)
+    score_before    = Column(Float)
+    score_after     = Column(Float)
+    resolved        = Column(Boolean, default=False)
+    rolled_back     = Column(Boolean, default=False)  # True if repair was reverted
+    duration_ms     = Column(Integer)
+    timestamp       = Column(DateTime, default=datetime.utcnow)
 
 
 class EvalSnapshot(Base):

@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-05-11T10:11:47.610064",
+  "namespace": "mxbai-embed-large",
+  "config": {
+    "llm": "mistral",
+    "embedding_model": "mxbai-embed-large"
+  },
+  "num_questions": 30,
+  "averages": {
+    "rouge_l": 0.3941,
+    "semantic_similarity": 0.7895,
+    "ctx_question_sim": 0.6581,
+    "ctx_ground_truth_sim": 0.6593,
+    "best_ctx_question_sim": 0.7516,
+    "best_ctx_gt_sim": 0.7837
+  }
+}

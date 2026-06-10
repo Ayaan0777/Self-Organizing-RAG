@@ -15,7 +15,7 @@ import streamlit as st
 import pandas as pd
 from db.session import get_session, init_db
 
-from db.models import QueryLog, LowRecallEvent, EvalSnapshot
+from db.models import QueryLog, LowRecallEvent, EvalSnapshot, RepairReport
 
 init_db()
 
@@ -590,11 +590,11 @@ session = get_session()
 
 page = st.sidebar.radio(
     "NAVIGATE",
-    ["Overview", "Ingest Document", "Ask Query", "Query Diagnostics", "Flagged Events", "Eval History"],
+    ["Overview", "Ingest Document", "Ask Query", "Add Chunks", "Query Diagnostics",
+     "Flagged Events", "Repair History", "Eval History"],
 )
 
 st.sidebar.markdown("---")
-st.sidebar.markdown(f"<span style='font-size:0.65rem;color:#2a2a60;letter-spacing:2px;'>v3 // TERMINAL EDITION</span>", unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -650,43 +650,32 @@ if page == "Overview":
         st.info("▸ NO QUERIES LOGGED — send queries via /api/v1/query to begin tracking.")
 
     term_div()
-    sec_header("DETECTION RULE MATRIX")
+    sec_header("DETECTION METRICS (MENTOR'S FRAMEWORK)")
     st.markdown("""
     <table class="rules-table">
         <tr>
-            <th>RULE</th>
-            <th>TRIGGER CONDITION</th>
-            <th>THRESHOLD</th>
+            <th>METRIC</th>
+            <th>HOW IT'S MEASURED</th>
+            <th>THRESHOLD / METHOD</th>
+            <th>REPAIR ACTION</th>
         </tr>
         <tr>
-            <td><code>low_top_score</code></td>
-            <td>Best chunk similarity below floor</td>
-            <td class="thresh">0.45</td>
+            <td><code>retrieval_precision</code></td>
+            <td>Proportion of top-k chunks with score &ge; 0.45</td>
+            <td class="thresh">&lt; 50% relevant</td>
+            <td>Complexity-based chunk sizing</td>
         </tr>
         <tr>
-            <td><code>score_drop</code></td>
-            <td>Gap between rank-1 and rank-k too large</td>
-            <td class="thresh">0.30</td>
+            <td><code>context_sufficiency</code></td>
+            <td>LLM checks if context has relevant info to answer the question</td>
+            <td class="thresh">LLM &rarr; NO (completely irrelevant)</td>
+            <td>Increase chunk size (1500)</td>
         </tr>
         <tr>
-            <td><code>llm_uncertainty</code></td>
-            <td>Response contains hedging language</td>
-            <td class="thresh">keyword</td>
-        </tr>
-        <tr>
-            <td><code>semantic_mismatch</code></td>
-            <td>Chunks are semantically fragmented</td>
-            <td class="thresh">0.55</td>
-        </tr>
-        <tr>
-            <td><code>evidence_mismatch</code></td>
-            <td>LLM answer diverges from retrieved context</td>
-            <td class="thresh">0.50</td>
-        </tr>
-        <tr>
-            <td><code>user_frustration</code></td>
-            <td>Similar query re-asked within 5 min</td>
-            <td class="thresh">0.85</td>
+            <td><code>hallucination_rate</code></td>
+            <td>LLM checks if answer contradicts or has wrong facts vs context</td>
+            <td class="thresh">LLM &rarr; YES (contradiction found)</td>
+            <td>Decrease chunk size (400)</td>
         </tr>
     </table>
     """, unsafe_allow_html=True)
@@ -925,12 +914,13 @@ elif page == "Query Diagnostics":
                     term_div()
                     sec_header("FLAGGING ANALYSIS")
                     explanations = {
+                        "low_retrieval_precision": "LOW_RETRIEVAL_PRECISION — less than 50% of chunks are relevant",
+                        "context_insufficient":    "CONTEXT_INSUFFICIENT — context cannot fully answer the question",
+                        "hallucination_detected":  "HALLUCINATION_DETECTED — answer contains claims not in context",
+                        # Legacy detectors (for old logs)
                         "low_top_score":    "LOW_TOP_SCORE — best retrieved chunk scored below 0.45",
                         "score_drop":       "SCORE_DROP — large gap between rank-1 and rank-K scores",
                         "llm_uncertainty":  "LLM_UNCERTAINTY — response contains hedging language",
-                        "semantic_mismatch":"SEMANTIC_MISMATCH — retrieved chunks cover different topics",
-                        "evidence_mismatch":"EVIDENCE_MISMATCH — LLM answer diverges from retrieved context",
-                        "user_frustration": "USER_FRUSTRATION — similar query re-asked within 5 minutes",
                     }
                     for d in detectors:
                         st.markdown(
@@ -946,6 +936,19 @@ elif page == "Query Diagnostics":
                         f'<div style="font-family:var(--font-mono);font-size:0.8rem;margin-top:12px;color:#4a5280;letter-spacing:1px;">SEVERITY: {sev_map.get(event.severity, event.severity)}</div>',
                         unsafe_allow_html=True,
                     )
+
+                    # Show repair report if event was resolved
+                    repair = session.query(RepairReport).filter(
+                        RepairReport.event_id == event.id
+                    ).first()
+                    if repair:
+                        term_div()
+                        sec_header("REPAIR REPORT")
+                        rc1, rc2, rc3, rc4 = st.columns(4)
+                        rc1.metric("STRATEGY", repair.repair_reason or repair.strategy_used)
+                        rc2.metric("CHUNK SIZE", str(repair.chunk_size_used or "—"))
+                        rc3.metric("SCORE", f"{repair.score_before:.3f} → {repair.score_after:.3f}")
+                        rc4.metric("STATUS", "✅ COMMITTED" if repair.resolved else "🔄 ROLLED BACK")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -976,15 +979,180 @@ elif page == "Flagged Events":
         for r in rows:
             detectors = json.loads(r.triggered_detectors or "[]")
             log       = session.query(QueryLog).filter(QueryLog.id == r.query_log_id).first()
+            repair    = session.query(RepairReport).filter(RepairReport.event_id == r.id).first()
             data.append({
                 "ID":        r.id,
                 "Query":     (log.query[:60] if log else "—"),
                 "Severity":  r.severity,
                 "Detectors": ", ".join(detectors),
                 "Resolved":  "✓ YES" if r.resolved else "✗ NO",
+                "Repair":    (f"{repair.repair_reason} ({repair.score_before:.2f}→{repair.score_after:.2f})" if repair else "—"),
                 "Time":      str(r.timestamp)[:19],
             })
         render_table(pd.DataFrame(data))
+
+        # ── Re-query button for resolved events ─────────────────────
+        term_div()
+        sec_header("RE-QUERY COMPARISON (BEFORE vs AFTER)")
+        resolved_events = [r for r in rows if r.resolved]
+        if not resolved_events:
+            st.info("▸ No resolved events to re-query.")
+        else:
+            event_options = {}
+            for r in resolved_events:
+                log = session.query(QueryLog).filter(QueryLog.id == r.query_log_id).first()
+                if log:
+                    event_options[f"Event #{r.id} — {log.query[:60]}"] = (r, log)
+
+            if event_options:
+                selected_label = st.selectbox("SELECT RESOLVED EVENT", list(event_options.keys()))
+                event_obj, log_obj = event_options[selected_label]
+
+                if st.button("▸ RE-QUERY NOW", type="primary"):
+                    with st.spinner("Re-running query against current index..."):
+                        try:
+                            resp = requests.post(
+                                f"{API_BASE}/query",
+                                json={"query": log_obj.query},
+                                timeout=120,
+                            )
+                            if resp.status_code == 200:
+                                new_result = resp.json()
+                                new_answer = new_result.get("answer", "—")
+                                new_scores = new_result.get("scores", [])
+
+                                col_before, col_after = st.columns(2)
+                                with col_before:
+                                    sec_header("BEFORE (ORIGINAL)")
+                                    st.markdown(f"""
+                                    <div class="answer-card" style="border-color:var(--red);">
+                                        <div class="answer-label" style="color:var(--red);">ORIGINAL ANSWER</div>
+                                        <div class="answer-text">{log_obj.llm_response or '—'}</div>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                    old_scores = json.loads(log_obj.top_k_scores or "[]")
+                                    if old_scores:
+                                        st.metric("TOP-1 SCORE", f"{old_scores[0]:.4f}")
+
+                                with col_after:
+                                    sec_header("AFTER (CURRENT)")
+                                    st.markdown(f"""
+                                    <div class="answer-card" style="border-color:var(--green);">
+                                        <div class="answer-label" style="color:var(--green);">CURRENT ANSWER</div>
+                                        <div class="answer-text">{new_answer}</div>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                    if new_scores:
+                                        st.metric("TOP-1 SCORE", f"{new_scores[0]:.4f}")
+                            else:
+                                st.error(f"Re-query failed — HTTP {resp.status_code}")
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+# ══════════════════════════════════════════════════════════════════════════
+#  REPAIR HISTORY
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "Repair History":
+    page_header("ANALYSIS // REPAIRS", "REPAIR HISTORY")
+
+    rows = session.query(RepairReport).order_by(RepairReport.timestamp.desc()).limit(100).all()
+
+    if not rows:
+        st.info("▸ NO REPAIRS YET — the system will self-heal when failure rate exceeds 30%.")
+    else:
+        sec_header("ALL REPAIR ATTEMPTS")
+        data = []
+        for r in rows:
+            delta = (r.score_after or 0) - (r.score_before or 0)
+            data.append({
+                "ID":          r.id,
+                "Event":       r.event_id,
+                "Strategy":    r.repair_reason or r.strategy_used,
+                "Chunk Size":  r.chunk_size_used or "—",
+                "Score":       f"{r.score_before:.3f} → {r.score_after:.3f}" if r.score_before else "—",
+                "Delta":       f"{delta:+.3f}",
+                "Status":      "✅ COMMITTED" if r.resolved else "🔄 ROLLED BACK",
+                "Duration":    f"{(r.duration_ms or 0)/1000:.1f}s",
+                "Time":        str(r.timestamp)[:19],
+            })
+        render_table(pd.DataFrame(data))
+
+        # Summary metrics
+        term_div()
+        total_repairs = len(rows)
+        committed = sum(1 for r in rows if r.resolved)
+        rolled_back = sum(1 for r in rows if r.rolled_back)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("TOTAL REPAIRS", total_repairs)
+        c2.metric("COMMITTED", committed)
+        c3.metric("ROLLED BACK", rolled_back)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ADD CHUNKS
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "Add Chunks":
+    page_header("PIPELINE // INPUT", "ADD NEW CHUNKS")
+    backend_up = backend_status()
+
+    term_div()
+    st.markdown(
+        '<div style="font-family:var(--font-mono);font-size:0.8rem;color:#4a5280;margin-bottom:12px;">'
+        'Paste raw text below to preview how it will be chunked using Recursive Character Splitting '
+        '(max=1250, min=200, overlap=200). Optionally ingest chunks to Pinecone.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    raw_text = st.text_area("RAW TEXT", height=200, placeholder="// paste document text here...")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        source_name = st.text_input("SOURCE NAME", value="manual-paste")
+    with col2:
+        ns_chunk = st.text_input("NAMESPACE", value="", key="chunk_ns")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        chunk_btn = st.button("▸ CHUNK IT", type="primary", disabled=not raw_text.strip())
+    with col_b:
+        ingest_btn = st.button("▸ CHUNK + INGEST", disabled=not raw_text.strip() or not backend_up)
+
+    if chunk_btn or ingest_btn:
+        with st.spinner("Chunking..."):
+            try:
+                payload = {
+                    "text": raw_text.strip(),
+                    "source": source_name,
+                    "ingest": ingest_btn,
+                }
+                if ns_chunk.strip():
+                    payload["namespace"] = ns_chunk.strip()
+
+                resp = requests.post(f"{API_BASE}/auto-chunk", json=payload, timeout=120)
+                if resp.status_code == 200:
+                    result = resp.json()
+                    chunks_data = result.get("chunks", [])
+
+                    sec_header(f"RESULT: {result['num_chunks']} CHUNKS ({result.get('size_range', '')})")
+
+                    if ingest_btn and result.get("ingested"):
+                        st.success(f"▸ Ingested to namespace: {result.get('namespace', 'default')}")
+
+                    for i, c in enumerate(chunks_data):
+                        score_cls = "score-high" if c['chars'] >= 500 else ("score-mid" if c['chars'] >= 200 else "score-low")
+                        st.markdown(f"""
+                        <div class="chunk-card {score_cls}">
+                            <div class="chunk-rank">CHUNK_{i+1:02d} &nbsp;·&nbsp; {c['chars']} CHARS</div>
+                            <div class="chunk-text">{c['content'][:400]}{'…' if len(c['content']) > 400 else ''}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                else:
+                    st.error(f"Failed — HTTP {resp.status_code}")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  EVAL HISTORY
 # ══════════════════════════════════════════════════════════════════════════
 elif page == "Eval History":
     page_header("ANALYSIS // EVAL", "EVALUATION HISTORY")

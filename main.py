@@ -1,81 +1,153 @@
+"""
+Self-Organising RAG — Main Application
+=======================================
+FastAPI application with rate-based autonomous self-healing.
+
+The background worker uses a SLIDING WINDOW approach:
+  - Every 30 seconds, checks the last 50 queries
+  - If ≥15 are flagged (30% failure rate), triggers batch repair
+  - Repair strategy is auto-selected per event by the DECIDE stage
+"""
 import asyncio
 import logging
+import os
 from fastapi import FastAPI
 from api.routes import router
 from db.session import init_db, get_session
-from db.models import LowRecallEvent
+from db.models import QueryLog, LowRecallEvent
 from repair.orchestrator import handle_event
-import os
-# Set up logging format
+
+# Suppress noisy HTTP client logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 app = FastAPI(title="Self-Organising RAG — Auto-RAG Pipeline")
 app.include_router(router, prefix="/api/v1")
 
+# ── Rate-based repair parameters ────────────────────────────────────
+CHECK_INTERVAL_SECONDS = 30     # how often the worker checks (seconds)
+RATE_WINDOW            = 50     # sliding window: look at last N queries
+FAILURE_RATE_THRESHOLD = 0.30   # 30% = 15/50 flagged → trigger repair
+MIN_QUERIES_BEFORE_CHECK = 10   # don't check until at least N queries exist
+
+
 async def autonomous_maintenance_loop():
-    """Runs continuously in the background using a Multi-Strategy Waterfall."""
-    CHECK_INTERVAL_SECONDS = 10  # Keep at 10 for testing
-    
-    # The 3 strategies the worker will cycle through
-    STRATEGY_WATERFALL = ["semantic", "entropy", "llm"]
-    
+    """
+    Rate-based self-healing: SLIDING WINDOW approach.
+
+    Every CHECK_INTERVAL_SECONDS:
+      1. Query the most recent RATE_WINDOW queries (sliding window)
+      2. Count how many are flagged
+      3. If failure rate >= FAILURE_RATE_THRESHOLD → batch repair all unresolved events
+      4. If below threshold → do nothing (system is healthy)
+
+    Each event's repair strategy is auto-selected by the DECIDE stage
+    in repair/orchestrator.py based on:
+      - Which detectors triggered (context_insufficient, hallucination_detected)
+      - Query complexity (complex → bigger chunks, simple → smaller chunks)
+    """
     while True:
         try:
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
             session = get_session()
             try:
-                # 🛡️ THE NEW FILTER: Only grab events that are unresolved AND not marked unfixable
-                unresolved_events = session.query(LowRecallEvent).filter(
+                # ── Sliding window: get the most recent N queries ───
+                recent = session.query(QueryLog).order_by(
+                    QueryLog.timestamp.desc()
+                ).limit(RATE_WINDOW).all()
+
+                if len(recent) < MIN_QUERIES_BEFORE_CHECK:
+                    continue  # not enough data yet
+
+                # ── Calculate failure rate ──────────────────────────
+                flagged_count = sum(1 for q in recent if q.flagged)
+                total = len(recent)
+                failure_rate = flagged_count / total
+
+                if failure_rate < FAILURE_RATE_THRESHOLD:
+                    logging.info(
+                        f"✅ [Rate Monitor] {flagged_count}/{total} = "
+                        f"{failure_rate:.0%} — healthy (threshold: {FAILURE_RATE_THRESHOLD:.0%})"
+                    )
+                    continue
+
+                # ── Rate exceeded → BATCH REPAIR ───────────────────
+                logging.info(
+                    f"⚠️ [Rate Monitor] {flagged_count}/{total} = "
+                    f"{failure_rate:.0%} — TRIGGERING BATCH REPAIR"
+                )
+
+                unresolved = session.query(LowRecallEvent).filter(
                     LowRecallEvent.resolved == False,
-                    LowRecallEvent.unfixable == False
+                    LowRecallEvent.unfixable == False,
                 ).all()
-                
-                if unresolved_events:
-                    logging.info(f"⚠️ [Auto-Worker] Found {len(unresolved_events)} pending events.")
-                    
-                    for event in unresolved_events:
-                        # CIRCUIT BREAKER: Check if we've exhausted all strategies
-                        if event.attempts >= len(STRATEGY_WATERFALL):
-                            logging.warning(f"🛑 [Auto-Worker] Event {event.id} exhausted all {len(STRATEGY_WATERFALL)} attempts. Marking UNFIXABLE.")
-                            event.unfixable = True
-                            session.commit()
-                            continue
 
-                        # WATERFALL ROUTING: Pick the strategy based on the attempt count
-                        current_strategy = STRATEGY_WATERFALL[event.attempts]
-                        
-                        logging.info(f"⚙️ [Auto-Worker] Event {event.id} | Attempt {event.attempts + 1}/3 | Strategy: {current_strategy}")
-                        
-                        # Increment the attempt counter immediately so we don't get stuck if it crashes
-                        event.attempts += 1
-                        session.commit()
+                if not unresolved:
+                    logging.info("   No unresolved events to repair.")
+                    continue
 
-                        # Execute the repair surgery
-                        result = handle_event(event.id, strategy=current_strategy)
-                        
+                logging.info(
+                    f"🔧 [Batch Repair] Starting repair of {len(unresolved)} events..."
+                )
+                repaired, rolled_back, errors = 0, 0, 0
+                for i, event in enumerate(unresolved, 1):
+                    try:
+                        logging.info(
+                            f"   [{i}/{len(unresolved)}] Repairing event #{event.id}..."
+                        )
+                        result = handle_event(event.id)
+
                         if result.get("improved"):
-                            logging.info(f"✨ [Auto-Worker] Success! Event {event.id} repaired using {current_strategy}.")
-                            event.resolved = True
-                            session.commit()
-                        else:
-                            logging.info(f"📉 [Auto-Worker] Strategy '{current_strategy}' failed on Event {event.id}. Will escalate next cycle.")
+                            repaired += 1
+                            logging.info(
+                                f"   [{i}/{len(unresolved)}] ✅ Event #{event.id} COMMITTED "
+                                f"(strategy={result.get('strategy')}, "
+                                f"chunk_size={result.get('chunk_size')}, "
+                                f"score: {result.get('score_before', 0):.3f}→{result.get('score_after', 0):.3f})"
+                            )
+                        elif result.get("rolled_back"):
+                            rolled_back += 1
+                            logging.info(
+                                f"   [{i}/{len(unresolved)}] 🔄 Event #{event.id} ROLLED BACK "
+                                f"(strategy={result.get('strategy')}, "
+                                f"chunk_size={result.get('chunk_size')}, "
+                                f"score: {result.get('score_before', 0):.3f}→{result.get('score_after', 0):.3f})"
+                            )
+                        elif result.get("error"):
+                            errors += 1
+                            logging.warning(
+                                f"   Event {event.id}: {result['error']}"
+                            )
+                    except Exception as e:
+                        errors += 1
+                        logging.error(f"   Event {event.id} repair failed: {e}")
+
+                logging.info(
+                    f"🔧 [Batch Repair] Done: "
+                    f"{repaired} committed, {rolled_back} rolled back, {errors} errors"
+                )
+
             finally:
                 session.close()
 
         except Exception as e:
-            logging.error(f"❌ [Auto-Worker] Loop error: {e}")
+            logging.error(f"❌ [Rate Monitor] Loop error: {e}")
+
 
 @app.on_event("startup")
 async def startup():
-    # 1. Initialize the fresh database with the correct new columns
+    # Initialize database with latest schema
     init_db()
-    logging.info("🚀 Database layout initialized successfully.")
-    
-    # 2. Check if we are running in evaluation mode
+    logging.info("🚀 Database initialized.")
+
+    # Check if evaluation mode
     if os.getenv("ENV") == "evaluation":
-        logging.info("⏸️ [Auto-Worker] Evaluation mode detected. Background self-healing is DISABLED.")
+        logging.info("⏸️ Evaluation mode — background self-healing DISABLED.")
     else:
-        # 3. Normal mode: Detach the self-healing worker
         asyncio.create_task(autonomous_maintenance_loop())
-        logging.info("🤖 Autonomous self-healing worker detached and running.")
+        logging.info(
+            f"🤖 Rate-based self-healing worker started "
+            f"(window={RATE_WINDOW}, threshold={FAILURE_RATE_THRESHOLD:.0%}, "
+            f"interval={CHECK_INTERVAL_SECONDS}s)"
+        )
