@@ -1,0 +1,10 @@
+PINECONE_API_KEY=APIKEY
+PINECONE_INDEX_NAME=INDEX_NAME
+PINECONE_NAMESPACE=Namespace
+# Local Embeddings (Ollama)
+EMBEDDING_MODEL_NAME=mxbai-embed-large
+OLLAMA_BASE_URL=http://localhost:11434
+
+# LLM Provider
+LLM_PROVIDER=ollama
+LLM_MODEL_NAME=mistral:latest
