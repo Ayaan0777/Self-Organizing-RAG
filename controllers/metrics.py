@@ -80,6 +80,56 @@ def retrieval_precision_at_k(
 
 
 # ══════════════════════════════════════════════════════════════
+#  1b. RETRIEVAL RECALL @ K
+# ══════════════════════════════════════════════════════════════
+
+def retrieval_recall_at_k(
+    chunks: list[str],
+    ground_truths: list[str],
+    threshold: float = PRECISION_RELEVANCE_THRESHOLD,
+) -> float:
+    """
+    Measures what fraction of ground-truth answers are covered by at least
+    one retrieved chunk.
+
+    For each ground-truth, we compute its semantic similarity to every chunk.
+    A ground-truth is "recalled" if its best chunk match ≥ threshold.
+
+    This is the dual of precision@K:
+      - Precision: "Are the retrieved chunks relevant?"
+      - Recall:    "Did we retrieve everything that's relevant?"
+
+    Args:
+        chunks: List of retrieved chunk text strings (top-K).
+        ground_truths: List of reference answer strings.
+        threshold: Minimum similarity to count as recalled.
+
+    Returns:
+        Recall score (0.0–1.0). E.g., 0.5 means half the ground truths
+        are covered by at least one retrieved chunk.
+    """
+    if not chunks or not ground_truths:
+        return 0.0
+
+    try:
+        chunk_embeddings = [_get_embedding(chunk) for chunk in chunks]
+        recalled_count = 0
+
+        for gt in ground_truths:
+            gt_emb = _get_embedding(gt)
+            # Check if ANY chunk covers this ground truth
+            best_sim = max(
+                _cosine_sim(gt_emb, chunk_emb) for chunk_emb in chunk_embeddings
+            )
+            if best_sim >= threshold:
+                recalled_count += 1
+
+        return round(recalled_count / len(ground_truths), 4)
+    except Exception:
+        return 0.0
+
+
+# ══════════════════════════════════════════════════════════════
 #  2. CONTEXT SUFFICIENCY
 # ══════════════════════════════════════════════════════════════
 

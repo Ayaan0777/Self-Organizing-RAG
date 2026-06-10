@@ -69,7 +69,7 @@ async def auto_chunk_endpoint(req: AutoChunkReq):
 # ── Auto-RAG monitoring endpoints ─────────────────────────────
 import json as _json
 from db.session import get_session
-from db.models import QueryLog, LowRecallEvent, RepairReport
+from db.models import QueryLog, LowRecallEvent, RepairReport, AdaptationLog
 
 
 @router.get("/logs")
@@ -190,7 +190,7 @@ async def trigger_repair_loop(
 
 @router.get("/repair-report/{event_id}")
 def get_repair_report(event_id: int):
-    """Returns the latest repair report for a LowRecallEvent."""
+    """Returns the latest repair report + diagnosis for a LowRecallEvent."""
     s = get_session()
     try:
         report = (
@@ -202,6 +202,27 @@ def get_repair_report(event_id: int):
         if not report:
             raise HTTPException(status_code=404, detail="Repair report not found")
 
+        # Fetch the adaptation log for diagnosis/reasoning
+        adaptation = (
+            s.query(AdaptationLog)
+            .filter(AdaptationLog.event_id == event_id)
+            .order_by(AdaptationLog.created_at.desc())
+            .first()
+        )
+
+        diagnosis_info = {}
+        if adaptation:
+            try:
+                diag = _json.loads(adaptation.diagnosis or "{}")
+                diagnosis_info = {
+                    "root_cause": diag.get("root_cause", "unknown"),
+                    "question_category": diag.get("question_category", "unknown"),
+                    "severity_score": diag.get("severity_score", 0),
+                    "reasoning": diag.get("reasoning", ""),
+                }
+            except Exception:
+                pass
+
         return {
             "event_id": report.event_id,
             "strategy_used": report.strategy_used,
@@ -210,6 +231,15 @@ def get_repair_report(event_id: int):
             "resolved": report.resolved,
             "original_answer": report.original_answer,
             "resolved_answer": report.resolved_answer,
+            # Enhanced metrics
+            "precision_before": report.precision_before,
+            "precision_after": report.precision_after,
+            "recall_before": report.recall_before,
+            "recall_after": report.recall_after,
+            "accuracy_before": report.accuracy_before,
+            "accuracy_after": report.accuracy_after,
+            # Diagnosis
+            **diagnosis_info,
         }
     finally:
         s.close()

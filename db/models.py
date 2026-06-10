@@ -56,6 +56,13 @@ class RepairReport(Base):
     resolved      = Column(Boolean, default=False)
     original_answer = Column(Text, nullable=True)
     resolved_answer = Column(Text, nullable=True)
+    # ── Enhanced repair metrics (precision, recall, accuracy) ──
+    precision_before = Column(Float, nullable=True)
+    precision_after  = Column(Float, nullable=True)
+    recall_before    = Column(Float, nullable=True)
+    recall_after     = Column(Float, nullable=True)
+    accuracy_before  = Column(Float, nullable=True)
+    accuracy_after   = Column(Float, nullable=True)
     duration_ms   = Column(Integer)
     timestamp     = Column(DateTime, default=datetime.utcnow)
 

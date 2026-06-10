@@ -19,16 +19,13 @@ app.include_router(router, prefix="/api/v1")
 
 async def autonomous_maintenance_loop():
     """
-    Runs continuously in the background using metric-driven strategy selection.
-    
-    Replaces the old fixed waterfall (semantic → entropy → llm) with:
-      1. Cooldown check — skip events still in cooldown
-      2. Diagnosis — analyze which metrics failed and why
-      3. Strategy selection — pick the best fix with conflict resolution
-      4. Execution — repair with dynamic chunk config + rollback safety
+    Batch-driven self-healing loop — only triggers after 5 flagged questions
+    accumulate. Processes them as a batch with full diagnosis + strategy
+    selection + enhanced metric validation (precision, recall, accuracy).
     """
-    CHECK_INTERVAL_SECONDS = 10  # Keep at 10 for testing
-    MAX_ATTEMPTS = 5  # More attempts since strategies are now intelligent
+    CHECK_INTERVAL_SECONDS = 10
+    BATCH_THRESHOLD = 5
+    MAX_ATTEMPTS = 5
     
     while True:
         try:
@@ -39,80 +36,96 @@ async def autonomous_maintenance_loop():
                 unresolved_events = session.query(LowRecallEvent).filter(
                     LowRecallEvent.resolved == False,
                     LowRecallEvent.unfixable == False
-                ).all()
-                
-                if unresolved_events:
-                    logging.info(f"⚠️ [Auto-Worker] Found {len(unresolved_events)} pending events.")
-                    
-                    for event in unresolved_events:
-                        # CIRCUIT BREAKER: Check if we've exhausted max attempts
-                        if event.attempts >= MAX_ATTEMPTS:
-                            logging.warning(f"🛑 [Auto-Worker] Event {event.id} exhausted {MAX_ATTEMPTS} attempts. Marking UNFIXABLE.")
-                            event.unfixable = True
-                            session.commit()
-                            continue
+                ).order_by(LowRecallEvent.timestamp.asc()).all()
 
-                        # COOLDOWN CHECK: Skip events still in cooldown period
-                        if check_cooldown(event):
-                            logging.debug(f"⏳ [Auto-Worker] Event {event.id} in cooldown — skipping.")
-                            continue
+                current_count = len(unresolved_events)
 
-                        # LOAD QUERY LOG for diagnosis
-                        log = session.query(QueryLog).filter(
-                            QueryLog.id == event.query_log_id
-                        ).first()
-                        if not log:
-                            logging.warning(f"[Auto-Worker] Event {event.id} has no query log — skipping.")
-                            continue
-
-                        # DIAGNOSE: Determine root cause from metrics
-                        diagnosis = diagnose(event, log)
-                        logging.info(
-                            f"🔍 [Auto-Worker] Event {event.id} | "
-                            f"Root cause: {diagnosis['root_cause']} | "
-                            f"Category: {diagnosis['question_category']} | "
-                            f"Severity: {diagnosis['severity_score']}"
+                # BATCH GATE: Only process when threshold is met
+                if current_count < BATCH_THRESHOLD:
+                    if current_count > 0:
+                        logging.debug(
+                            f"⏳ [Auto-Worker] Accumulating: {current_count}/{BATCH_THRESHOLD} "
+                            f"flagged questions. Standing by..."
                         )
+                    continue
 
-                        # SELECT STRATEGY with conflict resolution
-                        recent = get_recent_adaptations(limit=5)
-                        current_config = get_active_config()
-                        strategy, config = select_strategy(diagnosis, current_config, recent)
-                        
-                        # Map the strategy to the rechunk function name
-                        rechunk_strategy = STRATEGY_TO_RECHUNK.get(strategy, "semantic")
-                        
-                        logging.info(
-                            f"⚙️ [Auto-Worker] Event {event.id} | "
-                            f"Attempt {event.attempts + 1}/{MAX_ATTEMPTS} | "
-                            f"Strategy: {strategy} → rechunk: {rechunk_strategy} | "
-                            f"Config: size={config.get('chunk_size')} overlap={config.get('chunk_overlap')}"
-                        )
-                        
-                        # Increment the attempt counter immediately
-                        event.attempts += 1
+                logging.info(
+                    f"🔥 [Auto-Worker] Threshold met! {current_count} flagged questions. "
+                    f"Processing batch of {BATCH_THRESHOLD}..."
+                )
+
+                batch = unresolved_events[:BATCH_THRESHOLD]
+                improved_count = 0
+                rolled_back_count = 0
+
+                for idx, event in enumerate(batch, start=1):
+                    # CIRCUIT BREAKER: Check if we've exhausted max attempts
+                    if event.attempts >= MAX_ATTEMPTS:
+                        logging.warning(f"🛑 [Auto-Worker] Event {event.id} exhausted {MAX_ATTEMPTS} attempts. Marking UNFIXABLE.")
+                        event.unfixable = True
                         session.commit()
+                        continue
 
-                        # EXECUTE the repair with dynamic config
-                        result = handle_event(
-                            event.id,
-                            strategy=rechunk_strategy,
-                            config=config,
-                            diagnosis=diagnosis,
+                    # COOLDOWN CHECK: Skip events still in cooldown period
+                    if check_cooldown(event):
+                        logging.debug(f"⏳ [Auto-Worker] Event {event.id} in cooldown — skipping.")
+                        continue
+
+                    # LOAD QUERY LOG for diagnosis
+                    log = session.query(QueryLog).filter(
+                        QueryLog.id == event.query_log_id
+                    ).first()
+                    if not log:
+                        logging.warning(f"[Auto-Worker] Event {event.id} has no query log — skipping.")
+                        continue
+
+                    # DIAGNOSE: Determine root cause from metrics
+                    diagnosis = diagnose(event, log)
+                    logging.info(
+                        f"⚙️ [Auto-Worker] [{idx}/{BATCH_THRESHOLD}] Event {event.id} | "
+                        f"Root cause: {diagnosis['root_cause']} | "
+                        f"Category: {diagnosis['question_category']} | "
+                        f"Severity: {diagnosis['severity_score']}"
+                    )
+
+                    # SELECT STRATEGY with conflict resolution
+                    recent = get_recent_adaptations(limit=5)
+                    current_config = get_active_config()
+                    strategy, config = select_strategy(diagnosis, current_config, recent)
+                    rechunk_strategy = STRATEGY_TO_RECHUNK.get(strategy, "semantic")
+
+                    # Increment the attempt counter immediately
+                    event.attempts += 1
+                    session.commit()
+
+                    # EXECUTE the repair with enhanced metrics
+                    result = handle_event(
+                        event.id,
+                        strategy=rechunk_strategy,
+                        config=config,
+                        diagnosis=diagnosis,
+                    )
+                    
+                    if result.get("improved"):
+                        logging.info(f"✅ [Auto-Worker] Event {event.id} HEALED using {strategy}.")
+                        event.resolved = True
+                        session.commit()
+                        improved_count += 1
+                    else:
+                        logging.info(
+                            f"⚠️ [Auto-Worker] Strategy '{strategy}' "
+                            f"{'rolled back' if result.get('rolled_back') else 'failed'} "
+                            f"on Event {event.id}. Will re-diagnose next cycle."
                         )
-                        
-                        if result.get("improved"):
-                            logging.info(f"✨ [Auto-Worker] Success! Event {event.id} repaired using {strategy}.")
-                            event.resolved = True
-                            session.commit()
-                        else:
-                            logging.info(
-                                f"📉 [Auto-Worker] Strategy '{strategy}' "
-                                f"{'rolled back' if result.get('rolled_back') else 'failed'} "
-                                f"on Event {event.id}. Will re-diagnose next cycle."
-                            )
-                            # Set cooldown to prevent immediate re-attempt
-                            set_cooldown(event, session)
+                        set_cooldown(event, session)
+                        if result.get("rolled_back"):
+                            rolled_back_count += 1
+
+                logging.info(
+                    f"🏁 [Auto-Worker] Batch complete: "
+                    f"✅ {improved_count} improved, 🔄 {rolled_back_count} rolled back. "
+                    f"Returning to accumulation mode."
+                )
             finally:
                 session.close()
 

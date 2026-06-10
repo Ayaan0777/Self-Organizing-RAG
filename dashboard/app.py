@@ -502,9 +502,9 @@ label[data-testid="stWidgetLabel"] p {
 # ══════════════════════════════════════════════════════════════════════════
 def check_backend():
     try:
-        resp = requests.get(f"{API_BASE}/logs?limit=1", timeout=3)
+        resp = requests.get(f"{API_BASE}/logs?limit=1", timeout=8)
         return resp.status_code == 200
-    except requests.ConnectionError:
+    except (requests.ConnectionError, requests.Timeout, requests.ReadTimeout):
         return False
 
 def page_header(prefix, title):
@@ -1044,12 +1044,75 @@ elif page == "Flagged Events":
             if report_resp.status_code == 200:
                 report = report_resp.json()
 
+                # ── Row 1: Strategy & Scores ──
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("STRATEGY USED", report.get("strategy_used") or "N/A")
                 col2.metric("SCORE BEFORE", report.get("score_before") if report.get("score_before") is not None else "N/A")
                 col3.metric("SCORE AFTER", report.get("score_after") if report.get("score_after") is not None else "N/A")
                 col4.metric("RESOLVED STATUS", "YES" if report.get("resolved") else "NO")
 
+                # ── Row 2: Diagnosis Reason ──
+                root_cause = report.get("root_cause")
+                reasoning = report.get("reasoning")
+                q_category = report.get("question_category")
+                if root_cause or reasoning:
+                    term_div()
+                    sec_header("DIAGNOSIS — REASON FOR RESOLUTION")
+                    d1, d2 = st.columns([1, 2])
+                    with d1:
+                        st.metric("ROOT CAUSE", (root_cause or "N/A").upper().replace("_", " "))
+                        st.metric("QUESTION TYPE", (q_category or "N/A").upper().replace("_", " "))
+                    with d2:
+                        st.markdown(f"""
+                        <div class="answer-card" style="border-left-color: var(--amber);">
+                            <div class="answer-label" style="color: var(--amber);">REASONING</div>
+                            <div class="answer-text" style="font-size: 0.82rem;">{reasoning or 'No diagnosis available.'}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                # ── Row 3: Enhanced Metrics (Precision, Recall, Accuracy) ──
+                has_metrics = any(report.get(k) is not None for k in [
+                    "precision_before", "recall_before", "accuracy_before"
+                ])
+                if has_metrics:
+                    term_div()
+                    sec_header("IMPROVEMENT SCORES")
+
+                    def fmt_metric(val):
+                        return f"{val:.2%}" if val is not None else "—"
+
+                    def fmt_delta(before, after):
+                        if before is not None and after is not None:
+                            delta = after - before
+                            sign = "+" if delta >= 0 else ""
+                            return f"{sign}{delta:.2%}"
+                        return None
+
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric(
+                        "CONTEXT PRECISION",
+                        fmt_metric(report.get("precision_after")),
+                        delta=fmt_delta(report.get("precision_before"), report.get("precision_after")),
+                    )
+                    m2.metric(
+                        "RECALL",
+                        fmt_metric(report.get("recall_after")),
+                        delta=fmt_delta(report.get("recall_before"), report.get("recall_after")),
+                    )
+                    m3.metric(
+                        "ANSWER ACCURACY",
+                        fmt_metric(report.get("accuracy_after")),
+                        delta=fmt_delta(report.get("accuracy_before"), report.get("accuracy_after")),
+                    )
+                    st.caption(
+                        f"BEFORE → AFTER  ·  "
+                        f"Precision: {fmt_metric(report.get('precision_before'))} → {fmt_metric(report.get('precision_after'))}  ·  "
+                        f"Recall: {fmt_metric(report.get('recall_before'))} → {fmt_metric(report.get('recall_after'))}  ·  "
+                        f"Accuracy: {fmt_metric(report.get('accuracy_before'))} → {fmt_metric(report.get('accuracy_after'))}"
+                    )
+
+                # ── Row 4: Answers ──
+                term_div()
                 st.text_area("ORIGINAL ANSWER", value=report.get("original_answer") or "", height=180, disabled=True)
                 st.text_area("RESOLVED ANSWER", value=report.get("resolved_answer") or "", height=180, disabled=True)
             elif report_resp.status_code == 404:
