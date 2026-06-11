@@ -63,6 +63,10 @@ class RepairReport(Base):
     recall_after     = Column(Float, nullable=True)
     accuracy_before  = Column(Float, nullable=True)
     accuracy_after   = Column(Float, nullable=True)
+    # ── Dynamic K + retrieved chunk texts ──
+    dynamic_k          = Column(Integer, nullable=True)
+    chunks_before_text = Column(Text, nullable=True)   # JSON list of old retrieved chunks
+    chunks_after_text  = Column(Text, nullable=True)    # JSON list of new retrieved chunks
     duration_ms   = Column(Integer)
     timestamp     = Column(DateTime, default=datetime.utcnow)
 

@@ -607,17 +607,16 @@ if page == "Overview":
     total    = session.query(QueryLog).count()
     flagged  = session.query(QueryLog).filter(QueryLog.flagged == True).count()
     healthy  = total - flagged
-    events   = session.query(LowRecallEvent).count()
     resolved = session.query(LowRecallEvent).filter(LowRecallEvent.resolved == True).count()
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("TOTAL QUERIES",  total)
     c2.metric("HEALTHY",        healthy)
     c3.metric("FLAGGED",        flagged)
-    c4.metric("EVENTS",         events)
+    c4.metric("RESOLVED",       resolved)
 
     flag_rate = round(flagged / total * 100, 1) if total else 0
-    res_rate  = round(resolved / events * 100, 1) if events else 0
+    res_rate  = round(resolved / flagged * 100, 1) if flagged else 0
     st.caption(f"FLAG RATE: {flag_rate}%  ·  RESOLUTION RATE: {res_rate}%")
 
     # ── Stage 2 Metric Gauges ──
@@ -668,7 +667,7 @@ if page == "Overview":
                     "flagged": r.flagged,
                 })
         if trend_data:
-            
+
 
             col1, col2 = st.columns(2)
             with col1:
@@ -736,19 +735,11 @@ elif page == "Ingest Document":
 
     term_div()
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        uploaded_file = st.file_uploader(
-            "TARGET FILE",
-            type=["pdf", "docx", "txt"],
-            help="Supported: PDF · DOCX · TXT",
-        )
-    with col2:
-        namespace = st.text_input(
-            "NAMESPACE (optional)",
-            value="",
-            help="Leave blank for default namespace from .env",
-        )
+    uploaded_file = st.file_uploader(
+        "TARGET FILE",
+        type=["pdf", "docx", "txt"],
+        help="Supported: PDF · DOCX · TXT",
+    )
 
     if uploaded_file is not None:
         st.markdown(
@@ -762,8 +753,6 @@ elif page == "Ingest Document":
                 try:
                     files  = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type or "application/octet-stream")}
                     params = {}
-                    if namespace.strip():
-                        params["namespace"] = namespace.strip()
 
                     resp = requests.post(f"{API_BASE}/ingest", files=files, params=params, timeout=300)
 
@@ -798,18 +787,12 @@ elif page == "Ask Query":
         placeholder="// enter query string...",
     )
 
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        namespace = st.text_input("NAMESPACE", value="", key="query_ns")
-
     submit_query = st.button("▸ EXECUTE QUERY", type="primary", disabled=not backend_up or not query_text.strip())
 
     if submit_query and query_text.strip():
         with st.spinner("RETRIEVING CONTEXT · GENERATING ANSWER..."):
             try:
                 payload = {"query": query_text.strip()}
-                if namespace.strip():
-                    payload["namespace"] = namespace.strip()
 
                 t0   = time.time()
                 resp = requests.post(f"{API_BASE}/query", json=payload, timeout=120)
@@ -870,12 +853,61 @@ elif page == "Ask Query":
 elif page == "Query Diagnostics":
     page_header("ANALYSIS // LOGS", "QUERY DIAGNOSTICS")
 
-    rows = session.query(QueryLog).order_by(QueryLog.timestamp.desc()).limit(100).all()
+    # ── Pagination setup ──
+    PAGE_SIZE = 10
+    total_queries = session.query(QueryLog).count()
+    total_pages = max(1, (total_queries + PAGE_SIZE - 1) // PAGE_SIZE)
 
-    if not rows:
+    if "diag_page" not in st.session_state:
+        st.session_state.diag_page = 0
+
+    # Clamp page to valid range
+    st.session_state.diag_page = max(0, min(st.session_state.diag_page, total_pages - 1))
+    current_page = st.session_state.diag_page
+    offset = current_page * PAGE_SIZE
+
+    rows = (
+        session.query(QueryLog)
+        .order_by(QueryLog.timestamp.desc())
+        .offset(offset)
+        .limit(PAGE_SIZE)
+        .all()
+    )
+
+    if not rows and total_queries == 0:
         st.info("▸ NO QUERIES LOGGED — use Ask Query page to populate this view.")
     else:
         sec_header("QUERY LOG SUMMARY")
+
+        # ── Pagination controls ──
+        nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
+        with nav1:
+            if st.button("◂ PREV", disabled=(current_page == 0), key="diag_prev"):
+                st.session_state.diag_page -= 1
+                st.rerun()
+        with nav2:
+            if st.button("NEXT ▸", disabled=(current_page >= total_pages - 1), key="diag_next"):
+                st.session_state.diag_page += 1
+                st.rerun()
+        with nav3:
+            start_row = offset + 1
+            end_row = min(offset + PAGE_SIZE, total_queries)
+            st.markdown(
+                f'<div style="font-family:var(--font-mono);font-size:0.75rem;color:var(--cyan);'
+                f'letter-spacing:1px;padding:8px 0;text-align:center;">'
+                f'SHOWING {start_row}–{end_row} OF {total_queries} QUERIES'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with nav4:
+            if st.button("◂◂ FIRST", disabled=(current_page == 0), key="diag_first"):
+                st.session_state.diag_page = 0
+                st.rerun()
+        with nav5:
+            if st.button("LAST ▸▸", disabled=(current_page >= total_pages - 1), key="diag_last"):
+                st.session_state.diag_page = total_pages - 1
+                st.rerun()
+
         summary_data = []
         for r in rows:
             cqs  = getattr(r, "ctx_q_sim", None)
@@ -890,6 +922,15 @@ elif page == "Query Diagnostics":
                 "Time":          str(r.timestamp)[:19],
             })
         render_table(pd.DataFrame(summary_data))
+
+        # ── Page indicator bar ──
+        st.markdown(
+            f'<div style="font-family:var(--font-mono);font-size:0.68rem;color:var(--muted);'
+            f'letter-spacing:2px;text-align:center;margin:8px 0 4px 0;">'
+            f'PAGE {current_page + 1} / {total_pages}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
         term_div()
         sec_header("QUERY INSPECTOR")
@@ -1007,6 +1048,7 @@ elif page == "Flagged Events":
     with col2:
         res_filter = st.selectbox("FILTER BY RESOLVED", ["ALL", "RESOLVED", "UNRESOLVED"])
 
+    # ── Build filtered query ──
     q = session.query(LowRecallEvent).order_by(LowRecallEvent.timestamp.desc())
     if sev_filter != "ALL":
         q = q.filter(LowRecallEvent.severity == sev_filter)
@@ -1014,11 +1056,59 @@ elif page == "Flagged Events":
         q = q.filter(LowRecallEvent.resolved == True)
     elif res_filter == "UNRESOLVED":
         q = q.filter(LowRecallEvent.resolved == False)
-    rows = q.limit(200).all()
 
-    if not rows:
+    # ── Pagination setup ──
+    PAGE_SIZE = 10
+    total_events = q.count()
+    total_pages = max(1, (total_events + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    if "flag_page" not in st.session_state:
+        st.session_state.flag_page = 0
+
+    # Reset to page 0 when filters change
+    filter_key = f"{sev_filter}_{res_filter}"
+    if st.session_state.get("flag_filter_key") != filter_key:
+        st.session_state.flag_page = 0
+        st.session_state.flag_filter_key = filter_key
+
+    st.session_state.flag_page = max(0, min(st.session_state.flag_page, total_pages - 1))
+    current_page = st.session_state.flag_page
+    offset = current_page * PAGE_SIZE
+
+    rows = q.offset(offset).limit(PAGE_SIZE).all()
+
+    if not rows and total_events == 0:
         st.success("▸ NO FLAGGED EVENTS — pipeline is operating nominally.")
     else:
+        # ── Pagination controls ──
+        nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
+        with nav1:
+            if st.button("◂ PREV", disabled=(current_page == 0), key="flag_prev"):
+                st.session_state.flag_page -= 1
+                st.rerun()
+        with nav2:
+            if st.button("NEXT ▸", disabled=(current_page >= total_pages - 1), key="flag_next"):
+                st.session_state.flag_page += 1
+                st.rerun()
+        with nav3:
+            start_row = offset + 1
+            end_row = min(offset + PAGE_SIZE, total_events)
+            st.markdown(
+                f'<div style="font-family:var(--font-mono);font-size:0.75rem;color:var(--cyan);'
+                f'letter-spacing:1px;padding:8px 0;text-align:center;">'
+                f'SHOWING {start_row}–{end_row} OF {total_events} EVENTS'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with nav4:
+            if st.button("◂◂ FIRST", disabled=(current_page == 0), key="flag_first"):
+                st.session_state.flag_page = 0
+                st.rerun()
+        with nav5:
+            if st.button("LAST ▸▸", disabled=(current_page >= total_pages - 1), key="flag_last"):
+                st.session_state.flag_page = total_pages - 1
+                st.rerun()
+
         data = []
         for r in rows:
             detectors = json.loads(r.triggered_detectors or "[]")
@@ -1032,6 +1122,15 @@ elif page == "Flagged Events":
                 "Time":      str(r.timestamp)[:19],
             })
         render_table(pd.DataFrame(data))
+
+        # ── Page indicator bar ──
+        st.markdown(
+            f'<div style="font-family:var(--font-mono);font-size:0.68rem;color:var(--muted);'
+            f'letter-spacing:2px;text-align:center;margin:8px 0 4px 0;">'
+            f'PAGE {current_page + 1} / {total_pages}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
         term_div()
         sec_header("REPAIR REPORT")
@@ -1111,7 +1210,117 @@ elif page == "Flagged Events":
                         f"Accuracy: {fmt_metric(report.get('accuracy_before'))} → {fmt_metric(report.get('accuracy_after'))}"
                     )
 
-                # ── Row 4: Answers ──
+                # ── Row 4: Original Query Chunks (Fixed K=5) ──
+                # Pull the original 5 chunks from the QueryLog that triggered this event
+                selected_event = session.query(LowRecallEvent).filter(
+                    LowRecallEvent.id == selected_event_id
+                ).first()
+                original_log = None
+                original_chunks = []
+                if selected_event:
+                    original_log = session.query(QueryLog).filter(
+                        QueryLog.id == selected_event.query_log_id
+                    ).first()
+                    if original_log and original_log.retrieved_chunks:
+                        try:
+                            original_chunks = json.loads(original_log.retrieved_chunks)
+                        except Exception:
+                            original_chunks = []
+
+                chunks_before = report.get("chunks_before_text") or []
+                chunks_after = report.get("chunks_after_text") or []
+                dyn_k = report.get("dynamic_k")
+
+                if original_chunks or dyn_k or chunks_before or chunks_after:
+                    term_div()
+
+                    # ── Prominent Dynamic K Banner ──
+                    repair_k = dyn_k or len(chunks_before) or "?"
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, rgba(0,245,255,0.08) 0%, rgba(0,255,136,0.06) 100%);
+                                border: 1px solid rgba(0,245,255,0.25); border-radius: 4px;
+                                padding: 16px 24px; margin-bottom: 20px;
+                                display: flex; align-items: center; gap: 20px; flex-wrap: wrap;">
+                        <div style="font-family: 'Orbitron', monospace; font-size: 0.75rem;
+                                    color: var(--cyan); letter-spacing: 3px; text-transform: uppercase;">
+                            CHUNK RETRIEVAL COMPARISON
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 12px;
+                                    font-family: 'JetBrains Mono', monospace; font-size: 0.8rem;">
+                            <span style="background: rgba(0,245,255,0.12); border: 1px solid var(--cyan);
+                                         padding: 4px 14px; border-radius: 3px; color: var(--cyan);
+                                         font-weight: 700; letter-spacing: 1px;">
+                                INITIAL: K = 5 (FIXED)
+                            </span>
+                            <span style="color: var(--muted); font-size: 1.2rem;">→</span>
+                            <span style="background: rgba(0,255,136,0.12); border: 1px solid var(--green);
+                                         padding: 4px 14px; border-radius: 3px; color: var(--green);
+                                         font-weight: 700; letter-spacing: 1px;">
+                                REPAIR: K = {repair_k} (DYNAMIC)
+                            </span>
+                        </div>
+                        <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.68rem;
+                                    color: var(--muted); letter-spacing: 1px; margin-left: auto;">
+                            {len(chunks_before)} chunks before repair &nbsp;·&nbsp; {len(chunks_after)} after
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # ── Original Query Chunks (Fixed K=5) ──
+                    if original_chunks:
+                        sec_header("ORIGINAL QUERY CHUNKS (FIXED K = 5)")
+                        st.markdown("""
+                        <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.7rem;
+                                    color: var(--muted); letter-spacing: 1px; margin-bottom: 12px;">
+                            These are the 5 chunks retrieved when the query was first asked — before any repair.
+                        </div>
+                        """, unsafe_allow_html=True)
+                        for i, chunk in enumerate(original_chunks[:5]):
+                            preview = chunk[:300] + ("..." if len(chunk) > 300 else "")
+                            st.markdown(f"""
+                            <div style="background: rgba(0,245,255,0.03); border-left: 3px solid var(--cyan);
+                                        padding: 10px 14px; margin-bottom: 6px; border-radius: 0 4px 4px 0;
+                                        font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;
+                                        color: #8899cc; line-height: 1.5;">
+                                <span style="color: var(--cyan); font-weight: 600; font-size: 0.68rem;
+                                             letter-spacing: 2px;">CHUNK {i+1} / 5</span><br>
+                                {preview}
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                    # ── After Repair Chunks (Dynamic K) ──
+                    term_div()
+                    sec_header("REPAIR CHUNKS — AFTER REPAIR (DYNAMIC K)")
+
+                    is_resolved = report.get("resolved", False)
+                    label_color = "var(--green)" if is_resolved else "var(--red)"
+                    status_label = "IMPROVED" if is_resolved else "NOT IMPROVED"
+                    st.markdown(f"""
+                    <div style="color: {label_color}; font-size: 0.7rem; letter-spacing: 2px;
+                                margin-bottom: 10px; display: flex; align-items: center; gap: 8px;">
+                        <span style="display:inline-block; width:8px; height:8px; border-radius:50%;
+                                     background: {label_color}; box-shadow: 0 0 8px {label_color};"></span>
+                        AFTER REPAIR &nbsp;·&nbsp; K = {len(chunks_after)} &nbsp;·&nbsp; {status_label}
+                    </div>
+                    """, unsafe_allow_html=True)
+                    if chunks_after:
+                        for i, chunk in enumerate(chunks_after):
+                            preview = chunk[:300] + ("..." if len(chunk) > 300 else "")
+                            border_color = "var(--green)" if is_resolved else "var(--red)"
+                            bg_color = "rgba(0,220,130,0.05)" if is_resolved else "rgba(255,60,60,0.05)"
+                            st.markdown(f"""
+                            <div style="background:{bg_color};border-left:3px solid {border_color};
+                                        padding:10px 14px;margin-bottom:8px;border-radius:0 4px 4px 0;
+                                        font-family:'JetBrains Mono',monospace;font-size:0.72rem;
+                                        color:#c0c8e0;line-height:1.5;">
+                                <span style="color:{border_color};font-weight:600;">CHUNK {i+1}</span><br>
+                                {preview}
+                            </div>
+                            """, unsafe_allow_html=True)
+                    else:
+                        st.info("No chunk data recorded")
+
+                # ── Row 5: Answers ──
                 term_div()
                 st.text_area("ORIGINAL ANSWER", value=report.get("original_answer") or "", height=180, disabled=True)
                 st.text_area("RESOLVED ANSWER", value=report.get("resolved_answer") or "", height=180, disabled=True)
@@ -1199,15 +1408,13 @@ elif page == "Pipeline Config":
     sec_header("MANUAL OVERRIDE")
     backend_up = backend_status()
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
     with col1:
         new_size = st.number_input("CHUNK SIZE", min_value=100, max_value=2000, value=250, step=50)
     with col2:
         new_overlap = st.number_input("OVERLAP", min_value=0, max_value=500, value=80, step=10)
     with col3:
         new_strategy = st.selectbox("STRATEGY", ["semantic", "llm", "entropy"])
-    with col4:
-        new_ns = st.text_input("NAMESPACE", value="", key="cfg_ns")
 
     if st.button("▸ APPLY CONFIGURATION", type="primary", disabled=not backend_up):
         try:
@@ -1216,8 +1423,6 @@ elif page == "Pipeline Config":
                 "chunk_overlap": new_overlap,
                 "chunk_strategy": new_strategy,
             }
-            if new_ns.strip():
-                params["namespace"] = new_ns.strip()
             resp = requests.post(f"{API_BASE}/pipeline-config", params=params, timeout=10)
             if resp.status_code == 200:
                 st.success(f"▸ CONFIG UPDATED — size={new_size}, overlap={new_overlap}, strategy={new_strategy}")

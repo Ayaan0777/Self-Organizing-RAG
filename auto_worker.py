@@ -119,6 +119,9 @@ def run_batch_worker():
                             "accuracy_after": result.get("accuracy_after"),
                         })
 
+                        # Refresh event from DB to avoid stale session data
+                        session.expire(event)
+
                         if result.get("improved"):
                             print(f"    ✅ Event {event.id} HEALED using {strategy}.")
                             event.resolved = True
@@ -126,6 +129,7 @@ def run_batch_worker():
                         else:
                             status = "ROLLED_BACK" if result.get("rolled_back") else "FAILED"
                             print(f"    ⚠️ Event {event.id} {status}. Will re-diagnose next cycle.")
+                            event.resolved = False  # Explicitly keep unresolved
                             set_cooldown(event, session)
 
                     except Exception as loop_err:

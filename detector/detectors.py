@@ -29,9 +29,23 @@ FRUSTRATION_SIM    = 0.85   # rule 6: cosine sim threshold for "same query"
 FRUSTRATION_WINDOW = 300    # rule 6: seconds to look back for reformulations
 
 UNCERTAINTY_PHRASES = [
+    # Direct uncertainty
     "i don't know", "i'm not sure", "cannot find", "no information",
     "not available", "i cannot", "unclear", "no relevant", "don't have",
     "unable to find", "no context", "not enough information",
+    # Refusal / hedging patterns
+    "does not provide", "does not contain", "does not mention",
+    "does not specify", "does not include", "does not state",
+    "do not provide", "do not contain", "do not mention",
+    "doesn't provide", "doesn't contain", "doesn't mention",
+    "doesn't specify", "doesn't include",
+    "not mentioned", "not specified", "not provided", "not stated",
+    "no specific", "no mention of", "no evidence",
+    "cannot determine", "cannot be determined", "not explicitly",
+    "the text does not", "the context does not", "the passage does not",
+    "based on the provided", "not found in",
+    "there is no", "there are no",
+    "i could not", "could not find",
 ]
 
 

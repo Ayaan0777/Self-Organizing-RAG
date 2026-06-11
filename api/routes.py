@@ -223,6 +223,30 @@ def get_repair_report(event_id: int):
             except Exception:
                 pass
 
+        # If resolved but resolved_answer is missing, generate it on-the-fly
+        # and backfill the DB so it's only done once
+        resolved_answer = report.resolved_answer
+        if report.resolved and not resolved_answer:
+            try:
+                event = s.query(LowRecallEvent).filter(
+                    LowRecallEvent.id == event_id
+                ).first()
+                if event:
+                    log = s.query(QueryLog).filter(
+                        QueryLog.id == event.query_log_id
+                    ).first()
+                    if log:
+                        from controllers.retrieval import generate_answer_only
+                        rag_result = generate_answer_only(log.query)
+                        resolved_answer = rag_result.get("answer", "")
+                        # Backfill the DB record
+                        if resolved_answer:
+                            report.resolved_answer = resolved_answer
+                            s.commit()
+            except Exception as e:
+                import logging
+                logging.warning(f"[repair-report] On-the-fly answer generation failed: {e}")
+
         return {
             "event_id": report.event_id,
             "strategy_used": report.strategy_used,
@@ -230,7 +254,7 @@ def get_repair_report(event_id: int):
             "score_after": report.score_after,
             "resolved": report.resolved,
             "original_answer": report.original_answer,
-            "resolved_answer": report.resolved_answer,
+            "resolved_answer": resolved_answer,
             # Enhanced metrics
             "precision_before": report.precision_before,
             "precision_after": report.precision_after,
@@ -238,6 +262,10 @@ def get_repair_report(event_id: int):
             "recall_after": report.recall_after,
             "accuracy_before": report.accuracy_before,
             "accuracy_after": report.accuracy_after,
+            # Dynamic K + chunk comparison
+            "dynamic_k": report.dynamic_k,
+            "chunks_before_text": _json.loads(report.chunks_before_text or "[]"),
+            "chunks_after_text": _json.loads(report.chunks_after_text or "[]"),
             # Diagnosis
             **diagnosis_info,
         }

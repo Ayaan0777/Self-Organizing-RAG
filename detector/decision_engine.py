@@ -60,12 +60,15 @@ STRATEGY_CONFIGS = {
 }
 
 # Maps rechunk strategy names to the repair/chunker.py function names
+# Different strategies should use DIFFERENT chunking algorithms to actually
+# vary the repair approach — previously all mapped to "semantic" which meant
+# retries just repeated the same splitting logic with different sizes.
 STRATEGY_TO_RECHUNK = {
-    "reduce_chunk_size": "semantic",
-    "increase_chunk_size": "semantic",
-    "large_coherent_chunks": "semantic",
-    "tighten_chunks": "semantic",
-    "re_ingest": "semantic",
+    "reduce_chunk_size": "semantic",         # smaller semantic chunks
+    "increase_chunk_size": "semantic",       # larger semantic chunks
+    "large_coherent_chunks": "entropy",      # entropy-based for topic coherence
+    "tighten_chunks": "llm",                 # LLM-guided topic boundaries for precision
+    "re_ingest": "semantic",                 # re-embed with same strategy
 }
 
 # Default cooldown: seconds to wait before re-attempting repair on the same source

@@ -105,6 +105,9 @@ async def autonomous_maintenance_loop():
                         config=config,
                         diagnosis=diagnosis,
                     )
+
+                    # Refresh event from DB to avoid stale session data
+                    session.expire(event)
                     
                     if result.get("improved"):
                         logging.info(f"✅ [Auto-Worker] Event {event.id} HEALED using {strategy}.")
@@ -117,6 +120,7 @@ async def autonomous_maintenance_loop():
                             f"{'rolled back' if result.get('rolled_back') else 'failed'} "
                             f"on Event {event.id}. Will re-diagnose next cycle."
                         )
+                        event.resolved = False  # Explicitly keep unresolved
                         set_cooldown(event, session)
                         if result.get("rolled_back"):
                             rolled_back_count += 1
@@ -138,10 +142,7 @@ async def startup():
     init_db()
     logging.info("🚀 Database layout initialized successfully.")
     
-    # 2. Check if we are running in evaluation mode
-    if os.getenv("ENV") == "evaluation":
-        logging.info("⏸️ [Auto-Worker] Evaluation mode detected. Background self-healing is DISABLED.")
-    else:
-        # 3. Normal mode: Detach the self-healing worker
-        asyncio.create_task(autonomous_maintenance_loop())
-        logging.info("🤖 Autonomous self-healing worker detached and running.")
+    # 2. Auto-repair is handled by auto_worker.py (run separately).
+    #    Do NOT start autonomous_maintenance_loop() here to avoid
+    #    double-processing the same events.
+    logging.info("ℹ️ Repair loop disabled in uvicorn — use 'python auto_worker.py' for self-healing.")

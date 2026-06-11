@@ -42,6 +42,62 @@ STRATEGY_MAP = {
     "entropy":  rechunk_entropy,
 }
 
+# ── Dynamic K: maps question category to optimal K bounds ──
+CATEGORY_K_BOUNDS = {
+    "short_factual": (2, 4),    # precise, focused retrieval
+    "complex":       (5, 8),    # need more context
+    "cross_section": (6, 10),   # spanning multiple topics
+}
+DEFAULT_K_BOUNDS = (3, 6)
+
+# Score thresholds for dynamic K pruning
+SCORE_NOISE_FLOOR = 0.25   # chunks below this are noise
+SCORE_CLIFF_THRESHOLD = 0.12  # gap that signals a quality cliff
+
+
+def _dynamic_k_selection(
+    query: str,
+    question_category: str = None,
+    scores: list = None,
+) -> int:
+    """
+    Dynamic K Selection — decides how many chunks to retrieve based on
+    query complexity and (optionally) score distribution.
+
+    Stage 1: Set K bounds from question category
+    Stage 2: If scores are provided, prune below noise floor
+    Stage 3: Detect score cliff (largest drop > threshold)
+
+    Returns:
+        Optimal K (integer)
+    """
+    # Stage 1: Category-based K bounds
+    k_min, k_max = CATEGORY_K_BOUNDS.get(
+        question_category or "", DEFAULT_K_BOUNDS
+    )
+    target_k = (k_min + k_max) // 2  # midpoint as default
+
+    # If no scores to analyze, return the category midpoint
+    if not scores:
+        return target_k
+
+    # Stage 2: Absolute score pruning (remove noise)
+    valid = [s for s in scores if s >= SCORE_NOISE_FLOOR]
+    if len(valid) < k_min:
+        return max(k_min, len(valid)) if valid else k_min
+
+    # Stage 3: Score cliff detection
+    best_cliff_k = len(valid)  # default: keep all valid chunks
+    for i in range(1, len(valid)):
+        gap = valid[i - 1] - valid[i]
+        if gap > SCORE_CLIFF_THRESHOLD:
+            best_cliff_k = i  # cut AFTER the cliff
+            break
+
+    # Clamp to bounds
+    k = max(k_min, min(best_cliff_k, k_max))
+    return k
+
 
 # ══════════════════════════════════════════════════════════════
 #  ENHANCED MULTI-METRIC PROBE
@@ -55,10 +111,12 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / norm)
 
 
-def _probe_metrics(query: str, ground_truths: list = None, namespace: str = None) -> dict:
+def _probe_metrics(query: str, ground_truths: list = None,
+                   namespace: str = None, k: int = 5) -> dict:
     """
     Enhanced probe that evaluates the current retrieval quality using
     multiple metrics instead of just the top-1 score.
+    Uses dynamic K to retrieve the optimal number of chunks.
 
     Returns:
         {
@@ -67,21 +125,28 @@ def _probe_metrics(query: str, ground_truths: list = None, namespace: str = None
             "recall": float,           # fraction of ground truths covered by chunks
             "answer_accuracy": float,  # semantic similarity of answer vs ground truth
             "answer": str,             # the generated answer (for provenance)
-            "chunks": list[str],       # retrieved chunk texts
+            "chunks": list[str],       # retrieved chunk texts (dynamic K)
+            "scores": list[float],     # per-chunk similarity scores
+            "k_used": int,             # the K value actually used
         }
     """
     vs = get_vector_store(namespace)
-    results = vs.similarity_search_with_score(query, k=5)
+    # Over-fetch to allow score cliff detection, then prune
+    fetch_k = min(k * 2, 15)
+    results = vs.similarity_search_with_score(query, k=fetch_k)
 
     if not results:
         return {
             "top1_score": 0.0, "context_precision": 0.0,
             "recall": 0.0, "answer_accuracy": 0.0,
-            "answer": "", "chunks": [],
+            "answer": "", "chunks": [], "scores": [], "k_used": k,
         }
 
+    # Prune to the requested K
+    results = results[:k]
     top1_score = round(float(results[0][1]), 4)
     chunks = [doc.page_content for doc, _ in results]
+    scores = [round(float(s), 4) for _, s in results]
 
     # If ground truths are available, compute full metrics
     if ground_truths and len(ground_truths) > 0:
@@ -118,16 +183,28 @@ def _probe_metrics(query: str, ground_truths: list = None, namespace: str = None
             "answer_accuracy": answer_accuracy,
             "answer": answer,
             "chunks": chunks,
+            "scores": scores,
+            "k_used": k,
         }
     else:
-        # No ground truth — fallback to top-1 score only
+        # Still generate the answer even without ground truths — needed
+        # for storing the resolved_answer in the repair report.
+        try:
+            rag_result = generate_answer_only(query, namespace)
+            answer = rag_result.get("answer", "")
+        except Exception as e:
+            logging.warning(f"[probe] answer generation failed (no GT path): {e}")
+            answer = ""
+
         return {
             "top1_score": top1_score,
             "context_precision": None,
             "recall": None,
             "answer_accuracy": None,
-            "answer": "",
+            "answer": answer,
             "chunks": chunks,
+            "scores": scores,
+            "k_used": k,
         }
 
 
@@ -136,23 +213,27 @@ def _is_improved(before: dict, after: dict) -> bool:
     Determines if the repair improved metrics using a composite check.
 
     When ground truth is available:
-      - Improved if ANY of precision, recall, or accuracy improved meaningfully
+      - Improved if ANY of precision, recall, or accuracy improved
       - AND none of them degraded significantly
 
     When no ground truth:
-      - Fallback to top-1 score improvement (> 0.05)
+      - Improved if top-1 score increased (any positive delta)
+      - OR if the score is now above 0.7 (considered "good enough")
     """
     has_gt = before.get("context_precision") is not None
 
     if not has_gt:
-        # Fallback: classic top-1 score check
-        return after["top1_score"] > before["top1_score"] + 0.05
+        # Any positive improvement counts — the old +0.05 threshold was
+        # too strict and caused genuine improvements to be rolled back.
+        score_went_up = after["top1_score"] > before["top1_score"] + 0.001
+        score_now_good = after["top1_score"] >= 0.7 and before["top1_score"] < 0.7
+        return score_went_up or score_now_good
 
-    # Full metric comparison
-    prec_improved = (after["context_precision"] or 0) > (before["context_precision"] or 0) + 0.05
-    recall_improved = (after["recall"] or 0) > (before["recall"] or 0) + 0.05
-    acc_improved = (after["answer_accuracy"] or 0) > (before["answer_accuracy"] or 0) + 0.05
-    score_improved = after["top1_score"] > before["top1_score"] + 0.05
+    # Full metric comparison — relaxed thresholds
+    prec_improved = (after["context_precision"] or 0) > (before["context_precision"] or 0) + 0.01
+    recall_improved = (after["recall"] or 0) > (before["recall"] or 0) + 0.01
+    acc_improved = (after["answer_accuracy"] or 0) > (before["answer_accuracy"] or 0) + 0.01
+    score_improved = after["top1_score"] > before["top1_score"] + 0.001
 
     # Check for significant degradation in any metric
     prec_degraded = (after["context_precision"] or 0) < (before["context_precision"] or 0) - 0.1
@@ -281,9 +362,23 @@ def handle_event(
         ground_truths = _get_ground_truths_for_query(log)
         has_gt = len(ground_truths) > 0
 
-        # ── PROBE BEFORE: Measure current metrics ──
-        metrics_before = _probe_metrics(log.query, ground_truths)
+        # ── DYNAMIC K: select optimal K based on question category ──
+        q_category = diagnosis.get("question_category") or log.question_category or "unknown"
+        # First do a quick fetch to get scores for cliff detection
+        vs_quick = get_vector_store()
+        quick_results = vs_quick.similarity_search_with_score(log.query, k=15)
+        quick_scores = [round(float(s), 4) for _, s in quick_results]
+        dynamic_k = _dynamic_k_selection(log.query, q_category, quick_scores)
+
+        logging.info(
+            f"[repair] Event {event_id} | Dynamic K={dynamic_k} "
+            f"(category={q_category})"
+        )
+
+        # ── PROBE BEFORE: Measure current metrics with dynamic K ──
+        metrics_before = _probe_metrics(log.query, ground_truths, k=dynamic_k)
         score_before = metrics_before["top1_score"]
+        chunks_before_text = metrics_before.get("chunks", [])
 
         logging.info(
             f"[repair] Event {event_id} | BEFORE metrics: "
@@ -294,7 +389,9 @@ def handle_event(
         )
 
         # Get the SPECIFIC chunk IDs and text for the failing query
-        chunk_ids, full_text, source = _get_chunk_ids_for_query(log.query)
+        chunk_ids, full_text, source = _get_chunk_ids_for_query(
+            log.query, k=dynamic_k
+        )
 
         if not full_text.strip():
             return {"error": "Could not retrieve chunk text for repair — "
@@ -333,9 +430,10 @@ def handle_event(
                          old_chunk_ids=chunk_ids,
                          event_id=event_id)
 
-        # ── PROBE AFTER: Measure metrics post-repair ──
-        metrics_after = _probe_metrics(log.query, ground_truths)
+        # ── PROBE AFTER: Measure metrics post-repair with same dynamic K ──
+        metrics_after = _probe_metrics(log.query, ground_truths, k=dynamic_k)
         score_after = metrics_after["top1_score"]
+        chunks_after_text = metrics_after.get("chunks", [])
 
         # ── DECISION: Improved or rollback? ──
         improved = _is_improved(metrics_before, metrics_after)
@@ -358,7 +456,7 @@ def handle_event(
             rollback_result = rollback_from_snapshot(event_id)
             rolled_back = True
             # Re-probe after rollback to get accurate final score
-            metrics_final = _probe_metrics(log.query, ground_truths)
+            metrics_final = _probe_metrics(log.query, ground_truths, k=dynamic_k)
             score_after = metrics_final["top1_score"]
             print(f"[repair] Rollback complete. Score after rollback: {score_after:.3f}")
         else:
@@ -392,8 +490,13 @@ def handle_event(
             accuracy_before  = metrics_before.get("answer_accuracy"),
             accuracy_after   = metrics_after.get("answer_accuracy"),
             duration_ms   = int((time.time() - t0) * 1000),
+            # Dynamic K + chunk texts
+            dynamic_k         = dynamic_k,
+            chunks_before_text = json.dumps(chunks_before_text),
+            chunks_after_text  = json.dumps(chunks_after_text),
         )
-        event.resolved = improved
+        # NOTE: Do NOT set event.resolved here — the caller (main.py / auto_worker)
+        # manages the event lifecycle in its own session to prevent stale-data conflicts.
         session.add(report)
 
         # Build full metrics dicts for provenance logging
@@ -456,6 +559,7 @@ def handle_event(
             "strategy"     : strategy,
             "chunk_size"   : chunk_size,
             "chunk_overlap": chunk_overlap,
+            "dynamic_k"    : dynamic_k,
             "score_before" : round(score_before, 4),
             "score_after"  : round(score_after, 4),
             "precision_before": metrics_before.get("context_precision"),
@@ -469,6 +573,8 @@ def handle_event(
             "outcome"      : outcome,
             "chunks_before": counts["old_count"],
             "chunks_after" : counts["new_count"],
+            "chunks_before_text": chunks_before_text,
+            "chunks_after_text" : chunks_after_text,
             "duration_ms"  : report.duration_ms,
         }
 

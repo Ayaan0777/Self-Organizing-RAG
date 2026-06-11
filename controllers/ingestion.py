@@ -44,6 +44,7 @@ def process_and_store_file(file: UploadFile, namespace: str = None):
         print("🧹 Cleaning text (removing newlines and tabs)...")
         for doc in raw_documents:
             doc.page_content = clean_text(doc.page_content)
+            doc.metadata["source"] = file.filename  # Store real filename, not temp path
         # -------------------------
 
         print("✅ Text cleaning complete.")
