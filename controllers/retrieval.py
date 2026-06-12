@@ -20,7 +20,10 @@ def answer_query(query: str, namespace: str = None):
     scores = [round(float(s), 4) for _, s in docs_with_scores]
 
     prompt = ChatPromptTemplate.from_template(
-        "Answer the question based only on the context provided:\n\n{context}\n\nQuestion: {input}"
+        "You are a precise factual assistant. Answer the question using ONLY the context below. "
+        "Extract the answer directly from the text. Do NOT use any outside knowledge. "
+        "If the exact answer appears in the context, state it clearly and concisely.\n\n"
+        "Context:\n{context}\n\nQuestion: {input}\n\nAnswer:"
     )
     llm = get_llm()
     document_chain  = create_stuff_documents_chain(llm, prompt)
@@ -59,7 +62,10 @@ def generate_answer_only(query: str, namespace: str = None):
     scores = [round(float(s), 4) for _, s in docs_with_scores]
 
     prompt = ChatPromptTemplate.from_template(
-        "Answer the question based only on the context provided:\n\n{context}\n\nQuestion: {input}"
+        "You are a precise factual assistant. Answer the question using ONLY the context below. "
+        "Extract the answer directly from the text. Do NOT use any outside knowledge. "
+        "If the exact answer appears in the context, state it clearly and concisely.\n\n"
+        "Context:\n{context}\n\nQuestion: {input}\n\nAnswer:"
     )
     llm = get_llm()
     document_chain  = create_stuff_documents_chain(llm, prompt)

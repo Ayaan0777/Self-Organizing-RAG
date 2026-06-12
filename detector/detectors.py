@@ -20,11 +20,13 @@ from datetime import datetime, timedelta
 from db.session import get_session
 from db.models import QueryLog, LowRecallEvent
 
-# ── Detection thresholds — tune after observing real query scores ──
-SCORE_LOW          = 0.45   # rule 1: top-1 score below this → flag
-SCORE_DROP         = 0.3    # rule 2: gap rank-1 to rank-K above this → flag
-CHUNK_COHERENCE    = 0.55   # rule 4: mean pairwise chunk sim below this → flag
-EVIDENCE_MATCH     = 0.50   # rule 5: answer↔evidence sim below this → flag
+# ── Detection thresholds — calibrated for mxbai-embed-large ──
+# NOTE: This model produces similarity scores in the 0.55–0.85 range,
+# so thresholds must be higher than typical 0.3–0.6 range models.
+SCORE_LOW          = 0.65   # rule 1: top-1 score below this → flag
+SCORE_DROP         = 0.15   # rule 2: gap rank-1 to rank-K above this → flag
+CHUNK_COHERENCE    = 0.70   # rule 4: mean pairwise chunk sim below this → flag
+EVIDENCE_MATCH     = 0.60   # rule 5: answer↔evidence sim below this → flag
 FRUSTRATION_SIM    = 0.85   # rule 6: cosine sim threshold for "same query"
 FRUSTRATION_WINDOW = 300    # rule 6: seconds to look back for reformulations
 

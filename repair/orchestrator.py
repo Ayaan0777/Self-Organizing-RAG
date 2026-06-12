@@ -208,23 +208,64 @@ def _probe_metrics(query: str, ground_truths: list = None,
         }
 
 
+# ── Phrases that indicate the LLM couldn't find an answer ──
+# Short refusals (< 150 chars containing these = definite non-answer)
+_NON_ANSWER_PHRASES = [
+    "i don't know",
+    "i do not know",
+    "i cannot answer",
+    "i'm unable to",
+    "i am unable to",
+    "cannot find the answer",
+    "no information available",
+    "insufficient information to answer",
+    "unable to determine the answer",
+    "cannot determine the answer",
+    "does not provide information",
+    "does not contain information",
+    "does not mention",
+    "doesn't provide information",
+    "doesn't contain information",
+    "no specific information",
+    "not mentioned in the",
+    "not provided in the",
+]
+
+
+def _is_non_answer(answer: str) -> bool:
+    """
+    Detects if an LLM answer is a non-answer.
+    If the chunk contains the answer, the LLM answers directly — no hedging.
+    Any hedging phrase = the answer isn't in the chunks = non-answer.
+    """
+    if not answer or len(answer.strip()) < 10:
+        return True
+    lower = answer.lower().strip()
+    return any(phrase in lower for phrase in _NON_ANSWER_PHRASES)
+
+
 def _is_improved(before: dict, after: dict) -> bool:
     """
     Determines if the repair improved metrics using a composite check.
 
-    When ground truth is available:
-      - Improved if ANY of precision, recall, or accuracy improved
-      - AND none of them degraded significantly
+    Checks THREE things:
+      1. Did the retrieval score improve?
+      2. Did precision/recall/accuracy improve (if ground truth available)?
+      3. Is the new answer actually a real answer (not "I don't know")?
 
-    When no ground truth:
-      - Improved if top-1 score increased (any positive delta)
-      - OR if the score is now above 0.7 (considered "good enough")
+    A repair is REJECTED if the score improved but the LLM still
+    can't produce a real answer from the retrieved chunks.
     """
+    # CRITICAL: Even if scores improved, if the answer is still a non-answer
+    # then the repair didn't actually help — reject it.
+    after_answer = after.get("answer", "")
+    if _is_non_answer(after_answer):
+        return False
+
     has_gt = before.get("context_precision") is not None
 
     if not has_gt:
-        # Any positive improvement counts — the old +0.05 threshold was
-        # too strict and caused genuine improvements to be rolled back.
+        # Any positive improvement counts
         score_went_up = after["top1_score"] > before["top1_score"] + 0.001
         score_now_good = after["top1_score"] >= 0.7 and before["top1_score"] < 0.7
         return score_went_up or score_now_good
@@ -245,6 +286,7 @@ def _is_improved(before: dict, after: dict) -> bool:
     any_degraded = prec_degraded or recall_degraded or acc_degraded
 
     return any_improved and not any_degraded
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -388,6 +430,54 @@ def handle_event(
             f"accuracy={metrics_before.get('answer_accuracy', 'N/A')}"
         )
 
+        # ══════════════════════════════════════════════════════════
+        #  AUTO-RESOLVE: High-score events with good answers
+        # ══════════════════════════════════════════════════════════
+        # If retrieval is already good (score >= 0.72) and the LLM can produce
+        # a real answer, the flag was for LLM uncertainty — not poor retrieval.
+        # Auto-resolve without rechunking.
+        if score_before >= 0.72 and not has_gt:
+            answer_before = metrics_before.get("answer", "")
+            if not _is_non_answer(answer_before):
+                print(f"[repair] Event {event_id} | AUTO-RESOLVE: score={score_before:.3f} "
+                      f"is already good and answer is substantive. Resolving without rechunk.")
+                report = RepairReport(
+                    event_id=event_id,
+                    strategy_used="auto_resolve",
+                    chunks_before=0,
+                    chunks_after=0,
+                    score_before=round(score_before, 4),
+                    score_after=round(score_before, 4),
+                    resolved=True,
+                    original_answer=log.llm_response,
+                    resolved_answer=answer_before,
+                    dynamic_k=dynamic_k,
+                    chunks_before_text=json.dumps(chunks_before_text),
+                    chunks_after_text=json.dumps(chunks_before_text),
+                    duration_ms=int((time.time() - t0) * 1000),
+                )
+                session.add(report)
+                adaptation = AdaptationLog(
+                    event_id=event_id,
+                    observation=json.dumps({"auto_resolve": True, "score": score_before}),
+                    diagnosis=json.dumps(diagnosis),
+                    strategy_selected="auto_resolve",
+                    config_before=json.dumps({}),
+                    config_after=json.dumps({}),
+                    metrics_before=json.dumps({"top1_score": round(score_before, 4)}),
+                    metrics_after=json.dumps({"top1_score": round(score_before, 4)}),
+                    outcome="IMPROVED",
+                    rolled_back=False,
+                )
+                session.add(adaptation)
+                session.commit()
+                return {
+                    "outcome": "IMPROVED", "improved": True,
+                    "score_before": round(score_before, 4),
+                    "score_after": round(score_before, 4),
+                    "strategy": "auto_resolve",
+                }
+
         # Get the SPECIFIC chunk IDs and text for the failing query
         chunk_ids, full_text, source = _get_chunk_ids_for_query(
             log.query, k=dynamic_k
@@ -408,10 +498,12 @@ def handle_event(
               f"(size={chunk_size}, overlap={chunk_overlap})")
 
         # Save current config state for provenance
+        from detector.decision_engine import get_active_config
+        active_cfg = get_active_config()
         config_before = {
-            "chunk_size": 250,  # previous default
-            "chunk_overlap": 80,
-            "strategy": strategy,
+            "chunk_size": active_cfg.get("chunk_size", 250),
+            "chunk_overlap": active_cfg.get("chunk_overlap", 80),
+            "strategy": active_cfg.get("chunk_strategy", strategy),
         }
         config_after = {
             "chunk_size": chunk_size,
@@ -451,14 +543,131 @@ def handle_event(
 
         # ROLLBACK if repair degraded metrics
         if not improved:
-            print(f"[repair] Repair did NOT improve metrics "
-                  f"(score {score_before:.3f} → {score_after:.3f}). Rolling back...")
-            rollback_result = rollback_from_snapshot(event_id)
+            print(f"[repair] Rechunk did NOT improve metrics "
+                  f"(score {score_before:.3f} -> {score_after:.3f}). Rolling back...")
+            new_ids = counts.get("new_chunk_ids", [])
+            rollback_result = rollback_from_snapshot(event_id, new_chunk_ids=new_ids)
             rolled_back = True
             # Re-probe after rollback to get accurate final score
             metrics_final = _probe_metrics(log.query, ground_truths, k=dynamic_k)
             score_after = metrics_final["top1_score"]
             print(f"[repair] Rollback complete. Score after rollback: {score_after:.3f}")
+
+            # ══════════════════════════════════════════════════════
+            #  FALLBACK: Query Reformulation
+            # ══════════════════════════════════════════════════════
+            # Rechunking same content didn't help. Try reformulating
+            # the query to find DIFFERENT chunks across the entire index.
+            try:
+                from services.llm_factory import get_llm
+                llm = get_llm()
+                reformulate_prompt = (
+                    "You are a search query optimizer. Rephrase the following question "
+                    "to maximize vector search retrieval. Use different keywords, "
+                    "synonyms, and alternative phrasings while keeping the same meaning. "
+                    "Return ONLY the rephrased question, nothing else.\n\n"
+                    f"Original question: {log.query}"
+                )
+                reformulated = llm.invoke(reformulate_prompt).content.strip()
+                # Strip quotes if LLM wraps it
+                reformulated = reformulated.strip('"').strip("'")
+
+                if reformulated and reformulated.lower() != log.query.lower():
+                    print(f"[repair] Trying reformulated query: {reformulated[:80]}...")
+
+                    # Step 1: Use reformulated query to FIND better chunks
+                    metrics_reform = _probe_metrics(
+                        reformulated, ground_truths, k=dynamic_k
+                    )
+
+                    if metrics_reform["top1_score"] > score_before + 0.001:
+                        # Step 2: Generate the REAL answer using the ORIGINAL
+                        # query with the better chunks found via reformulation.
+                        # This is the key fix — we use the reformulated query
+                        # only for retrieval, never for answer generation.
+                        try:
+                            reform_chunks = metrics_reform.get("chunks", [])
+                            context_text = "\n\n".join(reform_chunks)
+                            answer_prompt = (
+                                "You are a precise factual assistant. Answer the question using ONLY the context below. "
+                                "Extract the answer directly from the text. Do NOT use any outside knowledge. "
+                                "If the exact answer appears in the context, state it clearly and concisely.\n\n"
+                                f"Context:\n{context_text}\n\n"
+                                f"Question: {log.query}\n\n"
+                                "Answer:"
+                            )
+                            real_answer = llm.invoke(answer_prompt).content.strip()
+                        except Exception:
+                            real_answer = metrics_reform.get("answer", "")
+
+                        if not _is_non_answer(real_answer):
+                            # Reformulated query found better chunks with real answer!
+                            print(f"[repair] REFORMULATION SUCCESS: "
+                                  f"score {score_before:.3f} -> {metrics_reform['top1_score']:.3f} "
+                                  f"with substantive answer")
+                            improved = True
+                            rolled_back = False
+                            score_after = metrics_reform["top1_score"]
+                            chunks_after_text = metrics_reform.get("chunks", [])
+                            resolved_answer = real_answer
+                            strategy = "query_reformulation"
+                        else:
+                            print(f"[repair] Reformulation found better chunks but answer "
+                                  f"is still a non-answer")
+                    else:
+                        print(f"[repair] Reformulation did not help "
+                              f"(score={metrics_reform['top1_score']:.3f})")
+            except Exception as e:
+                logging.warning(f"[repair] Query reformulation failed: {e}")
+
+            # ══════════════════════════════════════════════════════
+            #  FALLBACK 2: LLM Switch — try gemma3:27b
+            # ══════════════════════════════════════════════════════
+            # Rechunking and reformulation didn't help. The chunks
+            # might actually contain the answer, but mistral (7B)
+            # couldn't extract it. Try gemma3:27b (27B) — a larger
+            # model with better reasoning on the SAME chunks.
+            if not improved:
+                try:
+                    from services.llm_factory import get_fallback_llm
+                    fallback_llm = get_fallback_llm()
+
+                    # Use the original retrieved chunks (no modification)
+                    current_chunks = chunks_before_text
+                    if not current_chunks:
+                        current_chunks = metrics_before.get("chunks", [])
+
+                    if current_chunks:
+                        context_text = "\n\n".join(current_chunks)
+                        fallback_prompt = (
+                            "You are a precise factual assistant. Answer the question using ONLY the context below. "
+                            "Extract the answer directly from the text. Do NOT use any outside knowledge. "
+                            "If the exact answer appears in the context, state it clearly and concisely.\n\n"
+                            f"Context:\n{context_text}\n\n"
+                            f"Question: {log.query}\n\n"
+                            "Answer:"
+                        )
+
+                        print(f"[repair] Trying LLM fallback (gemma3:27b) on same chunks...")
+                        fallback_answer = fallback_llm.invoke(fallback_prompt).content.strip()
+
+                        if not _is_non_answer(fallback_answer):
+                            print(f"[repair] LLM FALLBACK SUCCESS: gemma3:27b extracted "
+                                  f"a substantive answer from the same chunks!")
+                            improved = True
+                            rolled_back = False
+                            # Score stays the same — chunks unchanged
+                            resolved_answer = fallback_answer
+                            strategy = "llm_fallback"
+                            chunks_after_text = current_chunks
+                        else:
+                            print(f"[repair] LLM fallback: gemma3:27b also couldn't "
+                                  f"extract an answer from these chunks.")
+                    else:
+                        print(f"[repair] LLM fallback skipped: no chunks available.")
+                except Exception as e:
+                    logging.warning(f"[repair] LLM fallback failed: {e}")
+
         else:
             # Success — keep the repaired answer
             resolved_answer = metrics_after.get("answer")

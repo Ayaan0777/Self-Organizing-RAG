@@ -113,19 +113,21 @@ def reembed(
     }
 
 
-def rollback_from_snapshot(event_id: int, namespace: str = None) -> dict:
+def rollback_from_snapshot(event_id: int, namespace: str = None,
+                           new_chunk_ids: list = None) -> dict:
     """
     Restores old chunks from ChunkSnapshot and deletes the new ones
     that were inserted during the failed repair.
 
     Process:
-      1. Load snapshot entries for this event_id
-      2. Re-embed the original text and upsert back to Pinecone
-      3. Delete any new chunks that were inserted during the repair
+      1. DELETE the new chunks that were inserted during the repair
+      2. Load snapshot entries for this event_id
+      3. Re-embed the original text and upsert back to Pinecone
 
     Args:
         event_id: The repair event whose chunks should be rolled back.
         namespace: Pinecone namespace.
+        new_chunk_ids: IDs of the new chunks to delete (from reembed return).
 
     Returns: {"restored": int, "failed": int}
     """
@@ -138,6 +140,14 @@ def rollback_from_snapshot(event_id: int, namespace: str = None) -> dict:
     session = get_session()
 
     try:
+        # ── Step 1: Delete the NEW chunks that were added during repair ──
+        if new_chunk_ids:
+            for i in range(0, len(new_chunk_ids), 1000):
+                batch = new_chunk_ids[i:i + 1000]
+                index.delete(ids=batch, namespace=ns)
+            print(f"[reembedder] deleted {len(new_chunk_ids)} new chunks from failed repair")
+
+        # ── Step 2: Restore old chunks from snapshot ──
         snapshots = session.query(ChunkSnapshot).filter(
             ChunkSnapshot.event_id == event_id,
             ChunkSnapshot.namespace == ns,
@@ -157,7 +167,7 @@ def rollback_from_snapshot(event_id: int, namespace: str = None) -> dict:
                 failed += 1
                 continue
             try:
-                fresh_emb = embeddings.embed_query(snap.text[:500])
+                fresh_emb = embeddings.embed_query(snap.text)
                 metadata = json.loads(snap.metadata_json) if snap.metadata_json else {}
                 upsert_batch.append({
                     "id": snap.vector_id,

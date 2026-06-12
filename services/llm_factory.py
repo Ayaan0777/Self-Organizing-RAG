@@ -68,3 +68,25 @@ def get_llm():
     else:
         raise ValueError(f"Unsupported LLM provider: {settings.llm_provider}")
     return _cached_llm
+
+
+_cached_fallback_llm = None
+
+
+def get_fallback_llm():
+    """
+    Returns the fallback LLM (cached after first call).
+    Used by the repair pipeline when the primary LLM can't extract
+    an answer — a larger model may succeed on the same chunks.
+    Default: gemma3:27b via Ollama.
+    """
+    global _cached_fallback_llm
+    if _cached_fallback_llm is not None:
+        return _cached_fallback_llm
+
+    _cached_fallback_llm = ChatOllama(
+        model=settings.fallback_llm_model,
+        base_url=settings.ollama_base_url,
+        temperature=0.2,
+    )
+    return _cached_fallback_llm

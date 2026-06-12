@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     # LLM
     llm_provider: str = "ollama"
     llm_model_name: str = "mistral"
+    fallback_llm_model: str = "gemma3:27b"
 
     # Gemini (for evaluation)
     gemini_api_key: str = ""

@@ -619,39 +619,6 @@ if page == "Overview":
     res_rate  = round(resolved / flagged * 100, 1) if flagged else 0
     st.caption(f"FLAG RATE: {flag_rate}%  ·  RESOLUTION RATE: {res_rate}%")
 
-    # ── Stage 2 Metric Gauges ──
-    term_div()
-    sec_header("STAGE 2 — MEASURE METRICS (LATEST EVAL)")
-    latest_eval = session.query(EvalSnapshot).order_by(EvalSnapshot.timestamp.desc()).first()
-    if latest_eval:
-        m1, m2, m3, m4 = st.columns(4)
-        rp = latest_eval.retrieval_precision
-        cs = latest_eval.context_sufficiency
-        hr = latest_eval.hallucination_rate
-        m1.metric("RETR. PRECISION", f"{rp:.2%}" if rp is not None else "—")
-        m2.metric("CTX SUFFICIENCY", f"{cs:.2%}" if cs is not None else "—")
-        m3.metric("HALLUCINATION",   f"{hr:.2%}" if hr is not None else "—")
-
-        # Pipeline config status
-        active_cfg = session.query(PipelineConfig).filter(
-            PipelineConfig.active == True
-        ).order_by(PipelineConfig.created_at.desc()).first()
-        if active_cfg:
-            m4.metric("CHUNK SIZE", f"{active_cfg.chunk_size} / {active_cfg.chunk_overlap}")
-        else:
-            m4.metric("CHUNK SIZE", "250 / 80 (default)")
-
-        # Adaptation stats
-        total_adaptations = session.query(AdaptationLog).count()
-        rollbacks = session.query(AdaptationLog).filter(AdaptationLog.rolled_back == True).count()
-        improvements = session.query(AdaptationLog).filter(AdaptationLog.outcome == "IMPROVED").count()
-        st.caption(
-            f"ADAPTATIONS: {total_adaptations}  ·  "
-            f"IMPROVED: {improvements}  ·  "
-            f"ROLLED BACK: {rollbacks}"
-        )
-    else:
-        st.info("▸ NO EVALUATION DATA — run an evaluation to see Stage 2 metrics.")
 
     term_div()
 
@@ -914,7 +881,7 @@ elif page == "Query Diagnostics":
             asim = getattr(r, "answer_sem_sim", None)
             summary_data.append({
                 "ID":            r.id,
-                "Query":         r.query[:90],
+                "Query":         r.query,
                 "Ctx↔Q Sim":    f"{cqs:.4f}"  if cqs  is not None else "—",
                 "Answer↔GT":    f"{asim:.4f}" if asim is not None else "—",
                 "Status":        "⚠ FLAGGED" if r.flagged else "✓ OK",
@@ -935,7 +902,7 @@ elif page == "Query Diagnostics":
         term_div()
         sec_header("QUERY INSPECTOR")
 
-        query_options   = {f"#{r.id} — {r.query[:70]}": r.id for r in rows}
+        query_options   = {f"#{r.id} — {r.query}": r.id for r in rows}
         selected_label  = st.selectbox("SELECT QUERY", list(query_options.keys()))
         selected_id     = query_options[selected_label]
         selected        = session.query(QueryLog).filter(QueryLog.id == selected_id).first()
@@ -1115,7 +1082,7 @@ elif page == "Flagged Events":
             log       = session.query(QueryLog).filter(QueryLog.id == r.query_log_id).first()
             data.append({
                 "ID":        r.id,
-                "Query":     (log.query[:60] if log else "—"),
+                "Query":     (log.query if log else "—"),
                 "Severity":  r.severity,
                 "Detectors": ", ".join(detectors),
                 "Resolved":  "✓ YES" if r.resolved else "✗ NO",
@@ -1145,29 +1112,164 @@ elif page == "Flagged Events":
 
                 # ── Row 1: Strategy & Scores ──
                 col1, col2, col3, col4 = st.columns(4)
-                col1.metric("STRATEGY USED", report.get("strategy_used") or "N/A")
-                col2.metric("SCORE BEFORE", report.get("score_before") if report.get("score_before") is not None else "N/A")
-                col3.metric("SCORE AFTER", report.get("score_after") if report.get("score_after") is not None else "N/A")
-                col4.metric("RESOLVED STATUS", "YES" if report.get("resolved") else "NO")
+                col1.metric("SCORE BEFORE", report.get("score_before") if report.get("score_before") is not None else "N/A")
+                col2.metric("SCORE AFTER", report.get("score_after") if report.get("score_after") is not None else "N/A")
+                col3.metric("RESOLVED STATUS", "YES" if report.get("resolved") else "NO")
+                col4.metric("DYNAMIC K", report.get("dynamic_k") or "N/A")
 
-                # ── Row 2: Diagnosis Reason ──
-                root_cause = report.get("root_cause")
-                reasoning = report.get("reasoning")
-                q_category = report.get("question_category")
-                if root_cause or reasoning:
-                    term_div()
-                    sec_header("DIAGNOSIS — REASON FOR RESOLUTION")
-                    d1, d2 = st.columns([1, 2])
-                    with d1:
-                        st.metric("ROOT CAUSE", (root_cause or "N/A").upper().replace("_", " "))
-                        st.metric("QUESTION TYPE", (q_category or "N/A").upper().replace("_", " "))
-                    with d2:
-                        st.markdown(f"""
-                        <div class="answer-card" style="border-left-color: var(--amber);">
-                            <div class="answer-label" style="color: var(--amber);">REASONING</div>
-                            <div class="answer-text" style="font-size: 0.82rem;">{reasoning or 'No diagnosis available.'}</div>
+                # ── Row 2: Strategy Explanation Card ──
+                strategy_raw = report.get("strategy_used") or "unknown"
+                root_cause = report.get("root_cause") or ""
+                reasoning = report.get("reasoning") or ""
+                q_category = report.get("question_category") or "unknown"
+                chunks_before_n = report.get("chunks_before") or 0
+                chunks_after_n = report.get("chunks_after") or 0
+
+                # Map strategy to human-friendly explanation
+                strategy_info = {
+                    "semantic": {
+                        "icon": "🔀", "label": "SEMANTIC RECHUNKING",
+                        "color": "var(--cyan)",
+                        "desc": f"Re-split source document using semantic boundaries with adjusted chunk size. "
+                                f"Chunks: {chunks_before_n} → {chunks_after_n}.",
+                    },
+                    "llm": {
+                        "icon": "🧠", "label": "LLM-GUIDED CHUNKING",
+                        "color": "#a78bfa",
+                        "desc": f"Used the LLM to identify natural topic boundaries and split text at "
+                                f"meaningful breakpoints. Chunks: {chunks_before_n} → {chunks_after_n}.",
+                    },
+                    "entropy": {
+                        "icon": "📊", "label": "ENTROPY-BASED CHUNKING",
+                        "color": "#f59e0b",
+                        "desc": f"Split at vocabulary novelty peaks — points where the topic shifts. "
+                                f"Chunks: {chunks_before_n} → {chunks_after_n}.",
+                    },
+                    "query_reformulation": {
+                        "icon": "🔍", "label": "QUERY REFORMULATION",
+                        "color": "#34d399",
+                        "desc": "Rechunking the same text didn't help, so the query was rephrased "
+                                "using the LLM to find better-matching chunks across the entire index.",
+                    },
+                    "auto_resolve": {
+                        "icon": "✅", "label": "AUTO-RESOLVED (GOOD RETRIEVAL)",
+                        "color": "var(--green)",
+                        "desc": "Retrieval score was already high (≥0.72) and the LLM produced a "
+                                "substantive answer. The flag was due to hedging language, not poor retrieval.",
+                    },
+                    "llm_fallback": {
+                        "icon": "🧠", "label": "LLM FALLBACK (GEMMA3:27B)",
+                        "color": "#f472b6",
+                        "desc": "Rechunking and query reformulation both failed. Switched to a larger "
+                                "LLM (gemma3:27b, 27B params) which extracted the answer from "
+                                "the same chunks that mistral (7B) couldn't handle.",
+                    },
+                }
+
+                # Determine sub-strategy details from root cause
+                root_cause_info = {
+                    "chunk_too_small": {
+                        "action": "EXPAND CHUNKS",
+                        "detail": "Chunk size was too small — important context was split across chunks. "
+                                  "Increased chunk size for more complete context per chunk.",
+                    },
+                    "chunk_too_large": {
+                        "action": "SHRINK CHUNKS",
+                        "detail": "Chunks were too large and diluted with irrelevant text. "
+                                  "Reduced chunk size for more precise, focused retrieval.",
+                    },
+                    "general_degradation": {
+                        "action": "GENERAL REPAIR",
+                        "detail": "Multiple detectors fired without a clear single root cause. "
+                                  "Applied general rechunking optimization.",
+                    },
+                    "hallucination_risk": {
+                        "action": "ANTI-HALLUCINATION",
+                        "detail": "LLM answer diverged from retrieved evidence. Rechunked to improve "
+                                  "context precision and reduce hallucination risk.",
+                    },
+                    "cross_section_failure": {
+                        "action": "MULTI-TOPIC REPAIR",
+                        "detail": "Query spans multiple topics but chunks only covered one. "
+                                  "Used topic-aware chunking to capture cross-section content.",
+                    },
+                }
+
+                info = strategy_info.get(strategy_raw, {
+                    "icon": "⚙️", "label": strategy_raw.upper().replace("_", " "),
+                    "color": "var(--cyan)",
+                    "desc": f"Applied {strategy_raw} strategy. Chunks: {chunks_before_n} → {chunks_after_n}.",
+                })
+                rc_info = root_cause_info.get(root_cause, None)
+
+                term_div()
+                sec_header("HOW THIS QUERY WAS RESOLVED")
+
+                # Strategy card
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, rgba(0,245,255,0.04) 0%, rgba(0,0,0,0) 100%);
+                            border: 1px solid {info['color']}40; border-left: 4px solid {info['color']};
+                            border-radius: 4px; padding: 20px 24px; margin-bottom: 16px;">
+                    <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+                        <span style="font-size: 1.4rem;">{info['icon']}</span>
+                        <span style="font-family: 'Orbitron', monospace; font-size: 0.85rem;
+                                     color: {info['color']}; letter-spacing: 2px; font-weight: 700;">
+                            {info['label']}
+                        </span>
+                    </div>
+                    <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.78rem;
+                                color: #8899cc; line-height: 1.6;">
+                        {info['desc']}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Root cause detail card (if available)
+                if rc_info:
+                    st.markdown(f"""
+                    <div style="display: flex; gap: 16px; margin-bottom: 16px;">
+                        <div style="flex: 1; background: rgba(255,150,50,0.04);
+                                    border: 1px solid rgba(255,150,50,0.2);
+                                    border-radius: 4px; padding: 14px 18px;">
+                            <div style="font-family: 'Orbitron', monospace; font-size: 0.65rem;
+                                        color: var(--amber); letter-spacing: 2px; margin-bottom: 6px;">
+                                ROOT CAUSE → {rc_info['action']}
+                            </div>
+                            <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;
+                                        color: #8899cc; line-height: 1.5;">
+                                {rc_info['detail']}
+                            </div>
                         </div>
-                        """, unsafe_allow_html=True)
+                        <div style="flex: 1; background: rgba(0,245,255,0.04);
+                                    border: 1px solid rgba(0,245,255,0.2);
+                                    border-radius: 4px; padding: 14px 18px;">
+                            <div style="font-family: 'Orbitron', monospace; font-size: 0.65rem;
+                                        color: var(--cyan); letter-spacing: 2px; margin-bottom: 6px;">
+                                QUESTION TYPE
+                            </div>
+                            <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.9rem;
+                                        color: var(--cyan); font-weight: 700;">
+                                {q_category.upper().replace('_', ' ')}
+                            </div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                # Reasoning (if available from diagnosis)
+                if reasoning:
+                    st.markdown(f"""
+                    <div style="background: rgba(0,0,0,0.2); border: 1px solid rgba(255,150,50,0.15);
+                                border-radius: 4px; padding: 12px 18px; margin-bottom: 8px;">
+                        <div style="font-family: 'Orbitron', monospace; font-size: 0.6rem;
+                                    color: var(--amber); letter-spacing: 2px; margin-bottom: 6px;">
+                            DIAGNOSIS REASONING
+                        </div>
+                        <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;
+                                    color: #8899cc; line-height: 1.5;">
+                            {reasoning}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
                 # ── Row 3: Enhanced Metrics (Precision, Recall, Accuracy) ──
                 has_metrics = any(report.get(k) is not None for k in [
@@ -1230,6 +1332,21 @@ elif page == "Flagged Events":
                 chunks_before = report.get("chunks_before_text") or []
                 chunks_after = report.get("chunks_after_text") or []
                 dyn_k = report.get("dynamic_k")
+
+                # Deduplicate chunks (duplicates existed due to a rollback bug)
+                def _dedup(chunks):
+                    seen = set()
+                    out = []
+                    for c in chunks:
+                        key = c[:200].strip()  # compare first 200 chars
+                        if key not in seen:
+                            seen.add(key)
+                            out.append(c)
+                    return out
+
+                original_chunks = _dedup(original_chunks)
+                chunks_before = _dedup(chunks_before)
+                chunks_after = _dedup(chunks_after)
 
                 if original_chunks or dyn_k or chunks_before or chunks_after:
                     term_div()

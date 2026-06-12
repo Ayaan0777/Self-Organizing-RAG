@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Text, Float, Boolean, DateTime, String
+from sqlalchemy import Column, Integer, Text, Float, Boolean, DateTime, String, ForeignKey
 from sqlalchemy.orm import declarative_base
 from datetime import datetime
 
@@ -30,7 +30,7 @@ class LowRecallEvent(Base):
     """Fired by detector/detectors.py when one or more rules trigger."""
     __tablename__ = "autorag_low_recall_events"
     id                  = Column(Integer, primary_key=True)
-    query_log_id        = Column(Integer)
+    query_log_id        = Column(Integer, ForeignKey("autorag_query_log.id"))
     triggered_detectors = Column(Text)       # JSON list e.g. ["low_top_score", "llm_uncertainty"]
     severity            = Column(String(10)) # LOW | MEDIUM | HIGH
     resolved            = Column(Boolean, default=False)
@@ -47,7 +47,7 @@ class RepairReport(Base):
     """Written by repair/orchestrator.py after each repair attempt."""
     __tablename__ = "autorag_repair_reports"
     id            = Column(Integer, primary_key=True)
-    event_id      = Column(Integer)
+    event_id      = Column(Integer, ForeignKey("autorag_low_recall_events.id"))
     strategy_used = Column(String(50))   # semantic | llm | entropy
     chunks_before = Column(Integer)
     chunks_after  = Column(Integer)
@@ -116,7 +116,7 @@ class ChunkSnapshot(Base):
     """
     __tablename__ = "autorag_chunk_snapshots"
     id          = Column(Integer, primary_key=True)
-    event_id    = Column(Integer)              # links to the repair event
+    event_id    = Column(Integer, ForeignKey("autorag_low_recall_events.id"))
     vector_id   = Column(String(200))           # Pinecone vector ID
     text        = Column(Text)                  # original chunk text
     metadata_json = Column(Text)                # JSON of original metadata
@@ -132,7 +132,7 @@ class AdaptationLog(Base):
     """
     __tablename__ = "autorag_adaptation_log"
     id                = Column(Integer, primary_key=True)
-    event_id          = Column(Integer)
+    event_id          = Column(Integer, ForeignKey("autorag_low_recall_events.id"))
     observation       = Column(Text)          # JSON: which metrics failed, their values
     diagnosis         = Column(Text)          # JSON: root cause, question category
     strategy_selected = Column(String(50))
