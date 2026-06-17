@@ -86,20 +86,30 @@ def _detect_semantic_mismatch(chunks: list[str]) -> bool:
 def _detect_evidence_mismatch(answer: str, chunks: list[str]) -> bool:
     """
     Rule 5 — LLM Response–Evidence Mismatch Detector
-    Compares the LLM's answer embedding against the concatenated evidence.
-    If the answer is semantically far from the evidence, the LLM may be
-    hallucinating or answering from parametric knowledge instead of context.
+    Checks whether the answer is grounded in AT LEAST ONE retrieved chunk.
+
+    Compares the answer embedding against each chunk individually and takes
+    the maximum similarity. If even the best-matching chunk falls below the
+    threshold, the answer isn't backed by anything we retrieved → flag.
+
+    Why per-chunk and not concatenated-evidence: a short factual answer
+    (e.g. "$5,000,000") embeds far from a long concatenated context blob
+    purely because of length asymmetry — the old "embed all chunks together"
+    version flagged correct answers reflexively. "Grounded in some chunk"
+    is what we actually mean by "evidence backs the answer."
     """
     if not answer or not chunks:
         return False
     try:
         emb_model = _get_embeddings_model()
         answer_emb = np.array(emb_model.embed_query(answer[:500]))
-        evidence_text = " ".join(chunks)[:1000]
-        evidence_emb = np.array(emb_model.embed_query(evidence_text))
-
-        sim = _cosine_sim(answer_emb, evidence_emb)
-        return sim < EVIDENCE_MATCH
+        max_sim = 0.0
+        for c in chunks:
+            chunk_emb = np.array(emb_model.embed_query(c[:500]))
+            sim = _cosine_sim(answer_emb, chunk_emb)
+            if sim > max_sim:
+                max_sim = sim
+        return max_sim < EVIDENCE_MATCH
     except Exception:
         return False
 
