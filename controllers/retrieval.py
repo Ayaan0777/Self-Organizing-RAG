@@ -101,6 +101,26 @@ def answer_query(query: str, namespace: str = None):
         chunk_metadatas = [d.metadata for d in docs],
         chunk_contents  = [d.page_content for d in docs],
     )
+
+    # If this query matches a known dataset question (dataset/long_ans.json),
+    # compute GT-backed metrics inline so the dashboard shows similarity /
+    # precision / sufficiency / hallucination without needing /evaluate-local.
+    # Failures are non-fatal — the answer is already returned regardless.
+    if log_id > 0:
+        try:
+            from controllers.gt_lookup import lookup_ground_truth, enrich_log_with_gt
+            gts = lookup_ground_truth(query)
+            if gts:
+                enrich_log_with_gt(
+                    log_id=log_id,
+                    query=query,
+                    answer=response["answer"],
+                    contexts=[d.page_content for d in docs],
+                    gts=gts,
+                )
+        except Exception as e:
+            logging.warning(f"[retrieval] GT enrichment failed (non-fatal): {e}")
+
     run_detectors(log_id)   # fires silently, never blocks the response
 
     return {
