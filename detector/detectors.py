@@ -165,9 +165,14 @@ def run_detectors(log_id: int):
         if scores and scores[0] < SCORE_LOW:
             triggered.append("low_top_score")
 
-        # Rule 2 — Big drop between rank-1 and rank-K (retrieval is inconsistent)
-        if len(scores) >= 2 and (scores[0] - scores[-1]) > SCORE_DROP:
-            triggered.append("score_drop")
+        # Rule 2 — Big drop between adjacent ranks (retrieval cliffs).
+        # Uses max adjacent gap, not rank-1 minus rank-K. The latter scales
+        # with K, so once dynamic K is promoted the rule's sensitivity drifts
+        # (K=2 → smaller spread, K=10 → wider). Max adjacent gap is K-invariant.
+        if len(scores) >= 2:
+            max_gap = max(scores[i] - scores[i + 1] for i in range(len(scores) - 1))
+            if max_gap > SCORE_DROP:
+                triggered.append("score_drop")
 
         # Rule 3 — LLM response contains uncertainty / hedging language
         if any(phrase in response for phrase in UNCERTAINTY_PHRASES):

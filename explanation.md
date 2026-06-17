@@ -6,6 +6,8 @@ This is a **self-healing Retrieval-Augmented Generation (RAG)** system that auto
 
 The system ingests documents into a Pinecone vector store, answers user questions using LLM + retrieved chunks, and **automatically monitors and repairs itself** when answer quality degrades.
 
+It uses a **single-pass ordered cascade** of 4 repair strategies, with a promotion system that elevates successful strategies into the main query pipeline.
+
 ---
 
 ## Architecture Diagram
@@ -19,7 +21,7 @@ flowchart TB
     
     subgraph "RAG Pipeline"
         API --> RET["controllers/retrieval.py"]
-        RET --> VS["Pinecone Vector Store"]
+        RET --> |"Dynamic K"| VS["Pinecone Vector Store"]
         RET --> LLM["Ollama Mistral 7B"]
         RET --> LOG["logger/query_logger.py"]
         LOG --> DB["SQLite Database"]
@@ -29,12 +31,18 @@ flowchart TB
     subgraph "Self-Healing Loop"
         DET --> |"Flag"| EVT["LowRecallEvent"]
         EVT --> AW["auto_worker.py"]
-        AW --> DE["detector/decision_engine.py"]
-        DE --> |"Diagnose + Strategy"| ORC["repair/orchestrator.py"]
-        ORC --> CHK["repair/chunker.py"]
-        ORC --> REB["repair/reembedder.py"]
+        AW --> |"≥5 AND ≥30%"| CAS["repair/cascade.py"]
+        CAS --> S1["S1: Dynamic K"]
+        CAS --> S2["S2: Chunk Size"]
+        CAS --> S3["S3: Combined"]
+        CAS --> S4["S4: Alt LLM"]
+        S2 --> CHK["repair/chunker.py"]
+        S2 --> REB["repair/reembedder.py"]
+        S3 --> CHK
+        S3 --> REB
         REB --> VS
-        ORC --> |"Provenance"| DB
+        CAS --> |"Provenance"| DB
+        CAS --> |"Promote S1"| RET
     end
 ```
 
@@ -46,35 +54,58 @@ flowchart TB
 
 | File | Purpose |
 |------|---------|
-| [main.py](file:///e:/CPP/anantha/main.py) | FastAPI app entry point, initializes DB |
-| [api/routes.py](file:///e:/CPP/anantha/api/routes.py) | REST endpoints for query, ingest, repair, evaluation |
-| [controllers/retrieval.py](file:///e:/CPP/anantha/controllers/retrieval.py) | RAG answer generation: retrieve chunks → LLM answer |
-| [controllers/ingestion.py](file:///e:/CPP/anantha/controllers/ingestion.py) | Document upload, text cleaning, chunking, Pinecone ingestion |
-| [services/llm_factory.py](file:///e:/CPP/anantha/services/llm_factory.py) | Cached singletons: Ollama LLM, embeddings, Pinecone index |
-| [config.py](file:///e:/CPP/anantha/config.py) | Pydantic settings loaded from `.env` |
+| `main.py` | FastAPI app entry point, initializes DB |
+| `api/routes.py` | REST endpoints for query, ingest, repair, evaluation, strategy counters, runtime flags |
+| `controllers/retrieval.py` | RAG answer generation: retrieve chunks → LLM answer (supports dynamic K) |
+| `controllers/ingestion.py` | Document upload, text cleaning, variable chunking (500–1250 chars), Pinecone ingestion |
+| `services/llm_factory.py` | Cached singletons: Ollama LLM, fallback LLM (gemma3:27b), embeddings, Pinecone index |
+| `config.py` | Pydantic settings loaded from `.env` |
 
 **How a query works:**
 ```
 User → POST /api/v1/query → retrieval.answer_query()
-  → Pinecone similarity_search (k=5)
-  → LLM generates answer from top-5 chunks
+  → _resolve_main_k(query)  // dynamic K if promoted, else 5
+  → Pinecone similarity_search (k=dynamic)
+  → LLM generates answer from top-K chunks
   → log_query() writes to SQLite
-  → run_detectors() checks for quality issues
+  → run_detectors() checks for quality issues (K-invariant)
   → Returns answer + scores to user
 ```
 
 ---
 
-### 2. Stage 1: DETECT — Quality Monitoring
+### 2. Ingestion Pipeline — Variable Chunk Sizing
 
-**File:** [detector/detectors.py](file:///e:/CPP/anantha/detector/detectors.py)
+**File:** `controllers/ingestion.py`
+
+**Ingestion range:** Documents are split into chunks between 500 and 1250 characters. Empty documents (no extractable text) are detected early and return a warning without crashing.
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| **Max chunk size** | 1250 chars | Upper bound for `RecursiveCharacterTextSplitter` |
+| **Min chunk size** | 500 chars | Enforced via `_enforce_min_chunk_size()` — tiny chunks are merged with neighbors |
+| **Chunk overlap** | 200 chars | 16% overlap for context continuity |
+| **Separators** | `\n\n → \n → . → ? → ! → ; → , → space` | Semantic hierarchy — splits at natural boundaries |
+
+**Min-size enforcement algorithm:**
+1. Buffer starts as the first chunk
+2. For each subsequent chunk: if buffer < 500 chars → merge into buffer
+3. After loop, if trailing buffer is still < 500 chars → merge backward with previous chunk
+
+This guarantees every chunk is ≥ 500 chars, ensuring meaningful embeddings.
+
+---
+
+### 3. Stage 1: DETECT — Quality Monitoring
+
+**File:** `detector/detectors.py`
 
 Six independent detection rules run after every query. If any trigger, a `LowRecallEvent` is created:
 
 | # | Rule | What it Detects | Threshold |
 |---|------|----------------|-----------|
 | 1 | `low_top_score` | Top-1 retrieval score too low | < 0.65 |
-| 2 | `score_drop` | Big gap between rank-1 and rank-K | > 0.15 gap |
+| 2 | `score_drop` | Largest adjacent-rank score gap | > 0.15 max adjacent gap |
 | 3 | `llm_uncertainty` | LLM response contains hedging language | 50+ phrases |
 | 4 | `semantic_mismatch` | Retrieved chunks are about different topics | pairwise sim < 0.70 |
 | 5 | `evidence_mismatch` | LLM answer doesn't match the evidence | answer↔evidence sim < 0.60 |
@@ -90,110 +121,140 @@ Six independent detection rules run after every query. If any trigger, a `LowRec
 
 ---
 
-### 3. Stage 2: MEASURE — Metrics Collection
+### 4. Stage 2: MEASURE — Metrics Collection
 
-**File:** [controllers/metrics.py](file:///e:/CPP/anantha/controllers/metrics.py)
+**File:** `controllers/metrics.py`
 
-When evaluation runs, these metrics are computed per-query:
+Four quality metrics computed per-query, all embedding-based (no extra LLM calls):
 
-| Metric | Description |
-|--------|-------------|
-| `retrieval_precision` | Fraction of top-K chunks relevant to the answer |
-| `context_sufficiency` | Whether context covers the full answer |
-| `hallucination_rate` | Fraction of ungrounded claims in the answer |
-| `question_category` | `short_factual` / `complex` / `cross_section` |
+| Metric | Description | Method |
+|--------|-------------|--------|
+| `retrieval_precision` | Fraction of top-K chunks relevant to the answer | Cosine sim of each chunk to ground truth ≥ 0.50 |
+| `context_sufficiency` | Whether context covers the full answer | Combined context ↔ ground truth sim ≥ 0.70 |
+| `hallucination_rate` | Fraction of ungrounded claims in the answer | Each sentence ↔ best chunk sim < 0.55 = ungrounded |
+| `question_category` | `short_factual` / `complex` / `cross_section` | **Embedding-based NLP classifier** (see below) |
+
+**Question Classifier — Embedding-based (NLP):**
+
+The classifier uses **prototype-based semantic similarity** instead of keyword matching:
+- 30 prototype queries (10 per category) define what each category "looks like"
+- Prototypes are embedded once on first call, then cached
+- Incoming queries are embedded and compared via cosine similarity to each category's prototypes
+- Category with highest mean similarity wins
+- Falls back to keyword-based heuristic if embedding model is unavailable
 
 ---
 
-### 4. Stage 3: DECIDE — Diagnosis & Strategy Selection
+### 5. Stage 3: DECIDE — Diagnosis
 
-**File:** [detector/decision_engine.py](file:///e:/CPP/anantha/detector/decision_engine.py)
+**File:** `detector/decision_engine.py`
 
-The decision engine analyzes **which detectors fired** + **question category** + **metrics** to determine a root cause and select the best repair strategy:
+The decision engine analyzes **which detectors fired** + **question category** + **metrics** to determine a root cause and recommend a chunk configuration:
 
 | Root Cause | When | Strategy | Chunk Config |
 |-----------|------|----------|-------------|
 | `high_hallucination` | Hallucination rate > 0.3 | `tighten_chunks` | 200 / 40 |
-| `chunk_too_large` | Short factual + low score | `reduce_chunk_size` | 256 / 50 |
-| `cross_section_failure` | Cross-section + fragmented | `large_coherent_chunks` | 1024 / 200 |
-| `chunk_too_small` | Complex + insufficient context | `increase_chunk_size` | 512 / 120 |
+| `chunk_too_large` | Short factual + low score | `reduce_chunk_size` | 350 / 70 |
+| `cross_section_failure` | Cross-section + fragmented | `large_coherent_chunks` | 1700 / 300 |
+| `chunk_too_small` | Complex + insufficient context | `increase_chunk_size` | 1400 / 250 |
 | `stale_content` | Score drop + very low score | `re_ingest` | Keep current |
-| `general_degradation` | Multiple triggers, no clear cause | `reduce_chunk_size` | 256 / 50 |
+| `general_degradation` | Multiple triggers, no clear cause | `reduce_chunk_size` | 350 / 70 |
 
-**Conflict resolution:** If the recommended strategy contradicts a recent successful adaptation (e.g., "reduce" after "increase" that worked), it keeps the working strategy.
+> [!NOTE]
+> The decision engine's `diagnose()` function is used by the cascade (Strategies 2 and 3) to pick chunk size configs. The old `select_strategy()`, `check_cooldown()`, and `set_cooldown()` functions are **deprecated** — the cascade handles strategy ordering.
 
-**Fallback rotation:** If a strategy recently failed, the system tries an alternative (e.g., `reduce_chunk_size` failed → try `tighten_chunks`).
+**Repair range:** The chunk size configs span 200–1700 chars, expanding beyond the ingestion baseline (500–1250) in both directions:
+
+```
+Repair shrink           Ingestion baseline            Repair grow
+[200 ═══════ 500] [═══════ 500–1250 ═══════] [1250 ═══════ 1700]
+  tighten(200)                                  increase(1400)
+  reduce(350)                                   large(1700)
+```
 
 ---
 
-### 5. Stage 4: ACT — 3-Tier Repair Pipeline
+### 6. Stage 4: ACT — Ordered Repair Cascade
 
-**File:** [repair/orchestrator.py](file:///e:/CPP/anantha/repair/orchestrator.py)
+**File:** `repair/cascade.py`
 
-The repair pipeline executes in 3 tiers, each targeting a different failure mode:
+The repair pipeline uses a **single-pass ordered cascade** of 4 strategies. Each event gets exactly ONE cascade pass — the first strategy that satisfies `_is_improved()` wins:
 
 ```mermaid
 flowchart TD
-    START["Flagged Event"] --> AUTO{"Score ≥ 0.72 &\nreal answer?"}
-    AUTO -->|Yes| DONE["✅ AUTO-RESOLVED"]
-    AUTO -->|No| T1["Tier 1: RECHUNK"]
-    T1 --> |"Improved?"| T1Y["✅ RESOLVED"]
-    T1 --> |"Not improved"| ROLL["Rollback chunks"]
-    ROLL --> T2["Tier 2: QUERY REFORMULATION"]
-    T2 --> |"Better chunks + real answer?"| T2Y["✅ RESOLVED"]
-    T2 --> |"Failed"| T3["Tier 3: LLM FALLBACK\n(gemma3:27b)"]
-    T3 --> |"Real answer?"| T3Y["✅ RESOLVED"]
-    T3 --> |"Failed"| FAIL["❌ ROLLED BACK"]
+    START["Flagged Event"] --> S1{{"S1: Dynamic K\n(no Pinecone change)"}}
+    S1 -->|Improved| WIN1["✅ RESOLVED\n+1 s1_dynamic_k"]
+    S1 -->|Not improved| S2{{"S2: Chunk Size\n(rechunk + reembed)"}}
+    S2 -->|Improved| WIN2["✅ RESOLVED\n+1 s2_chunk_size"]
+    S2 -->|Not improved| ROLL2["🔄 Rollback"] --> S3{{"S3: Combined\n(dynamic K + rechunk)"}}
+    S3 -->|Improved| WIN3["✅ RESOLVED\n+1 s3_combined"]
+    S3 -->|Not improved| ROLL3["🔄 Rollback"] --> S4{{"S4: Alt LLM\ngemma3:27b\n(no Pinecone change)"}}
+    S4 -->|Improved| WIN4["✅ RESOLVED\n+1 s4_alt_llm"]
+    S4 -->|Not improved| FAIL["❌ UNFIXABLE"]
 ```
 
-#### Tier 0: Auto-Resolve
-If the retrieval score is already ≥ 0.72 and the LLM produces a real answer (not a non-answer), the event is auto-resolved. The flag was for `llm_uncertainty` (hedging language), not poor retrieval.
+#### Strategy 1 — Dynamic K Selection (`s1_dynamic_k`)
+- Classifies the query (`short_factual` / `complex` / `cross_section`)
+- Selects K from category-specific ranges (2–10)
+- Re-probes with the new K — **no Pinecone modification**
+- Fast and safe — always tried first
 
-#### Tier 1: Rechunking
-1. Find the specific chunk IDs retrieved for the failing query
-2. Concatenate their text
-3. Re-split with a new chunk size/overlap from the decision engine
-4. Snapshot old chunks → delete → insert new chunks
-5. Re-probe metrics: if improved → keep; if degraded → rollback
+#### Strategy 2 — Chunk Size Variation (`s2_chunk_size`)
+- Uses `diagnose()` to pick the recommended chunk config
+- Rechunks the failing chunks with the new size/overlap
+- Calls `handle_event()` with `internal_rollback=False` — cascade owns rollback
+- Probes before and after at K=5; win-decision uses **local baseline** (same K) to avoid K-bias
+- If not improved → **rolls back** before continuing to S3
 
-#### Tier 2: Query Reformulation
-After rechunking fails and is rolled back:
-1. Ask the LLM to rephrase the query with different keywords
-2. Use the reformulated query to search the **entire index** for different chunks
-3. If better chunks found, generate the answer using the **original question** + the better chunks
-4. If the answer is substantive → resolved
+#### Strategy 3 — Combined (`s3_combined`)
+- Dynamic K (from S1) **+** rechunking (from S2) applied together
+- Calls `handle_event()` with `k_override=dynamic_k` and `internal_rollback=False`
+- Probes before and after at the same dynamic K; local baseline comparison
+- If not improved → **rolls back** before continuing to S4
 
-#### Tier 3: LLM Fallback (gemma3:27b)
-After rechunking and reformulation both fail:
-1. Take the same chunks from the original query
-2. Send them to `gemma3:27b` (27B params) instead of `mistral` (7B)
-3. The larger model may extract answers that the smaller model couldn't
-4. If the answer is substantive → resolved
+#### Strategy 4 — Alternate LLM (`s4_alt_llm`)
+- Same chunks, same K — swaps the LLM from Mistral (7B) to gemma3:27b (27B)
+- **No Pinecone modification** — only changes the answer generation
+- **Bypasses `_is_improved()`** — chunks are unchanged so score-delta is always 0. Instead uses custom win condition: `not _is_non_answer(fallback_answer)` (substantive answer = success)
+- The larger model may extract answers the smaller model couldn't
 
 > [!IMPORTANT]
-> **No chunks are modified in Tier 2 or Tier 3.** Tier 2 searches for different chunks. Tier 3 uses a different LLM on the same chunks. Only Tier 1 modifies the vector store.
+> **Rollback guarantee:** Cascade — not `handle_event` — owns rollback. S2 and S3 call `handle_event(internal_rollback=False)`, get raw post-rechunk metrics, and either keep the chunks (break) or rollback the snapshot before the next strategy. S1 and S4 never touch Pinecone.
+
+> [!NOTE]
+> **Per-strategy local baselines:** Each strategy returns `metrics_before_local` probed at the SAME K as its `metrics_after`. The cascade uses this for win-decisions instead of the cascade-level baseline, preventing K-mismatches from biasing the comparison (e.g., S2 at K=5 vs cascade baseline at dynamic K=8).
 
 ---
 
-### 6. Safety: Rollback & Provenance
+### 7. Auto Worker — Cascade Trigger
 
-#### Rollback ([reembedder.py](file:///e:/CPP/anantha/repair/reembedder.py))
-Before any chunk deletion, a `ChunkSnapshot` is saved to SQLite. If repair fails:
-1. Delete the new chunks that were inserted
-2. Load old chunks from snapshot
-3. Re-embed and upsert back to Pinecone
-4. Clean up snapshot entries
+**File:** `auto_worker.py`
 
-#### Provenance
-Every repair attempt writes two records:
-- **RepairReport**: score before/after, chunks before/after, strategy, resolved answer
-- **AdaptationLog**: full audit trail — observation → diagnosis → strategy → config → metrics → outcome
+A standalone daemon that monitors and triggers the repair cascade:
+
+```
+1. Poll database every 5 seconds
+2. Count pending events (unresolved AND not unfixable)
+3. Trigger when BOTH conditions met:
+   - Pending count ≥ 5
+   - Pending / total queries ≥ 30%
+4. Process ALL pending events (not just first 5):
+   → run_repair_cascade(event.id) for each
+5. Print batch summary (resolved / unfixable / errors)
+6. Return to monitoring mode
+```
+
+**Key differences from the old worker:**
+- No per-event retry loop — single pass only
+- No cooldowns — each event gets exactly one cascade
+- No `MAX_ATTEMPTS` — unfixable is the terminal state
+- Processes ALL pending events to prevent queue starvation
 
 ---
 
-### 7. Dynamic K Selection
+### 8. Dynamic K Selection
 
-**File:** [orchestrator.py](file:///e:/CPP/anantha/repair/orchestrator.py#L58-L99)
+**File:** `repair/orchestrator.py`
 
 Instead of fixed K=5 for all queries, the system dynamically selects K based on:
 
@@ -205,11 +266,40 @@ Instead of fixed K=5 for all queries, the system dynamically selects K based on:
 
 **Score cliff detection:** If there's a > 0.12 gap between consecutive chunk scores, cut at the cliff (lower chunks are noise).
 
+**Promotion:** After S1 (dynamic K) resolves 5 events successfully, it is permanently promoted to the main query pipeline. All future queries use dynamic K instead of hardcoded K=5.
+
+**Probe consistency:** After promotion, `_probe_metrics()` receives `k` explicitly and passes it through to `generate_answer_only(query, namespace, k=k)`. This ensures the answer in the metrics dict is generated from the **same chunks** that precision/recall were measured against — not from whatever K `_resolve_main_k()` would return independently.
+
 ---
 
-### 8. Non-Answer Detection
+### 9. Strategy Counters & Promotion
 
-**File:** [orchestrator.py](file:///e:/CPP/anantha/repair/orchestrator.py#L211-L244)
+**Files:** `repair/cascade.py`, `db/models.py`, `controllers/retrieval.py`
+
+The cascade tracks success counts per strategy:
+
+| Counter | Incremented When |
+|---------|-----------------|
+| `s1_dynamic_k` | Strategy 1 resolves an event |
+| `s2_chunk_size` | Strategy 2 resolves an event |
+| `s3_combined` | Strategy 3 resolves an event |
+| `s4_alt_llm` | Strategy 4 resolves an event |
+
+**Promotion logic (Strategy 1 only):**
+1. When `s1_dynamic_k.success_count ≥ 5` → set `RuntimeFlag("dynamic_k_promoted")` to True
+2. `controllers/retrieval.py` reads this flag on every request via `_resolve_main_k()`
+3. If promoted → classify query → return dynamic K
+4. If not promoted → return K=5 (unchanged behavior)
+5. Cascade skips S1 for future events (it's already in the main pipeline)
+
+> [!NOTE]
+> Promotion is **one-way** — once set, it never reverts. Only S1 is eligible for promotion.
+
+---
+
+### 10. Non-Answer Detection
+
+**File:** `repair/orchestrator.py`
 
 A critical guard that prevents marking "resolved" when the LLM actually said "I don't know":
 
@@ -219,32 +309,27 @@ Detected phrases: `"does not provide information"`, `"does not mention"`, `"i do
 
 ---
 
-### 9. Auto Worker (Batch Processing)
+### 11. Safety: Rollback & Provenance
 
-**File:** [auto_worker.py](file:///e:/CPP/anantha/auto_worker.py)
+#### Rollback (`repair/reembedder.py`)
+Before any chunk deletion, a `ChunkSnapshot` is saved to SQLite. If repair fails:
+1. Delete the new chunks that were inserted
+2. Load old chunks from snapshot
+3. Re-embed and upsert back to Pinecone
+4. Clean up snapshot entries
 
-A standalone daemon that runs the self-healing loop:
+#### Provenance
+**Ground truths:** `_get_ground_truths_for_query()` now returns `[]` unconditionally. The old behavior returned the previous LLM answer as a "ground truth", which was wrong — comparing repair results against the bad answer that triggered the flag produced meaningless metrics. Win-decisions now rely on retrieval scores and non-answer detection.
 
-```
-1. Poll database every 5 seconds
-2. When 5+ flagged events accumulate → start batch
-3. For each event in batch:
-   a. Check circuit breaker (max 5 attempts)
-   b. Check cooldown (120s between attempts)
-   c. Diagnose root cause
-   d. Select strategy
-   e. Execute repair (3-tier pipeline)
-   f. If improved → mark resolved
-   g. If failed → set cooldown, re-diagnose next cycle
-4. Print batch summary
-5. Return to accumulation mode
-```
+Every cascade run writes two records:
+- **RepairReport**: score before/after, strategy that won (or "none"), resolved answer
+- **AdaptationLog**: full audit trail — observation (including cascade steps) → diagnosis → strategy → outcome
 
 ---
 
-### 10. Dashboard
+### 12. Dashboard
 
-**File:** [dashboard/app.py](file:///e:/CPP/anantha/dashboard/app.py)
+**File:** `dashboard/app.py`
 
 Streamlit dashboard with 4 pages:
 
@@ -253,7 +338,7 @@ Streamlit dashboard with 4 pages:
 | **Overview** | Total queries, healthy, flagged, resolved counts. Score trends over time. |
 | **Query Diagnostics** | Per-query detail: scores, chunks, LLM response. Query inspector. |
 | **Flagged Events** | Expandable event cards with repair strategy explanation, chunks before/after, resolved answer. |
-| **Adaptation Log** | Full provenance timeline of every repair attempt. |
+| **Adaptation Log** | Full provenance timeline of every cascade run. |
 
 ---
 
@@ -274,6 +359,10 @@ erDiagram
         text llm_response
         float ctx_q_sim
         bool flagged
+        float retrieval_precision
+        bool context_sufficiency
+        float hallucination_rate
+        string question_category
     }
     
     LowRecallEvent {
@@ -294,6 +383,13 @@ erDiagram
         float score_after
         bool resolved
         text resolved_answer
+        float precision_before
+        float precision_after
+        float recall_before
+        float recall_after
+        float accuracy_before
+        float accuracy_after
+        int dynamic_k
     }
     
     AdaptationLog {
@@ -305,7 +401,40 @@ erDiagram
         string outcome
         bool rolled_back
     }
+
+    StrategyCounter {
+        int id PK
+        string strategy UK
+        int success_count
+        datetime last_incremented_at
+    }
+
+    RuntimeFlag {
+        int id PK
+        string name UK
+        bool value
+        datetime set_at
+    }
 ```
+
+---
+
+## API Endpoints
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| `POST` | `/api/v1/ingest` | Upload and ingest a document (PDF, DOCX, TXT) |
+| `POST` | `/api/v1/query` | Ask a question (RAG pipeline) |
+| `POST` | `/api/v1/evaluate` | Evaluate a question against ground truth |
+| `POST` | `/api/v1/repair/{event_id}` | Trigger repair cascade for a specific event |
+| `GET` | `/api/v1/logs` | Query logs with scores and flagging status |
+| `GET` | `/api/v1/events` | List LowRecallEvents |
+| `GET` | `/api/v1/repair-report/{event_id}` | Repair report + diagnosis for an event |
+| `GET` | `/api/v1/strategy-counters` | Strategy success counts for the cascade |
+| `GET` | `/api/v1/runtime-flags` | Runtime flags (e.g., dynamic K promotion) |
+| `GET` | `/api/v1/adaptation-log` | Full adaptation provenance trail |
+| `GET` | `/api/v1/pipeline-config` | Current chunking configuration |
+| `GET` | `/api/v1/eval-history` | Evaluation snapshot history |
 
 ---
 
@@ -326,39 +455,60 @@ erDiagram
 
 ## Bugs Discovered & Fixed
 
-### Bug 1: Rollback Duplicate Leak (Critical)
-**Where:** [reembedder.py](file:///e:/CPP/anantha/repair/reembedder.py#L116-L148)
+### Bug 1: Probe Answer/Chunk K Mismatch (Critical — Post-Promotion)
+**Where:** `repair/orchestrator.py` → `_probe_metrics()`, `controllers/retrieval.py` → `generate_answer_only()`
 
-**Problem:** Rollback restored old chunks but never deleted new chunks from the failed repair. After 5 failed attempts, each original chunk had ~5 duplicates in Pinecone (429 total duplicates found).
+**Problem:** `_probe_metrics()` measured chunks/precision/recall at the K it was called with, but called `generate_answer_only(query)` which used `_resolve_main_k()` — returning a *different* K after promotion. The answer in the metrics dict came from different chunks than the ones measured.
 
-**Fix:** `reembed()` now returns `new_chunk_ids`. `rollback_from_snapshot()` deletes them before restoring old chunks.
-
----
-
-### Bug 2: LLM Using Parametric Knowledge
-**Where:** [controllers/retrieval.py](file:///e:/CPP/anantha/controllers/retrieval.py#L22-L25)
-
-**Problem:** Old prompt `"Answer based on the context provided"` was too weak. Mistral would answer from its own knowledge when chunks didn't contain the answer, producing responses like *"it is known that..."*.
-
-**Fix:** Stricter prompt: *"Extract the answer directly from the text. Do NOT use any outside knowledge."*
+**Fix:** `generate_answer_only()` now accepts optional `k` parameter. `_probe_metrics()` passes `k` explicitly so answer generation uses the same K as chunk retrieval.
 
 ---
 
-### Bug 3: Non-Answer Detection Too Aggressive
-**Where:** [orchestrator.py](file:///e:/CPP/anantha/repair/orchestrator.py#L211-L244)
+### Bug 2: Ground Truth Returns Old Bad Answer
+**Where:** `repair/orchestrator.py` → `_get_ground_truths_for_query()`
 
-**Problem:** Phrases like `"based on the provided context"` appeared in the rejection list, but many valid answers started with this phrasing before providing the actual answer. This caused repairs to be falsely rejected.
+**Problem:** Returned `[log.llm_response]` (the old bad answer) as "ground truth" when `answer_sem_sim` was populated. Precision/recall computed against this were meaningless — they measured "did the repair match the bad answer?"
 
-**Fix:** Simplified to: any hedging = non-answer. If the chunk has the answer, the LLM just answers directly without hedging.
+**Fix:** Now returns `[]` unconditionally. Win-decisions rely on retrieval scores and non-answer detection.
 
 ---
 
-### Bug 4: Snapshot Not Cleaned Between Repairs
-**Where:** [reembedder.py](file:///e:/CPP/anantha/repair/reembedder.py#L188-L191)
+### Bug 3: Score Drop Detector Sensitive to K
+**Where:** `detector/detectors.py` → Rule 2 (`score_drop`)
 
-**Problem:** Snapshot entries for the same event_id accumulated across multiple repair attempts. When rolling back, it would restore ALL previous snapshots, not just the most recent one.
+**Problem:** Used `scores[0] - scores[-1]` (rank-1 minus rank-K). At K=2 (short_factual after promotion), only 2 scores — drop becomes less meaningful. At K=10, wider spread.
 
-**Status:** Mitigated — snapshots are now deleted after rollback (`session.query(ChunkSnapshot).filter(...).delete()`), but a race condition exists if two repair attempts run simultaneously on the same event.
+**Fix:** Changed to **max adjacent gap**: `max(scores[i] - scores[i+1])`. K-invariant — detects the same cliff regardless of how many chunks were retrieved.
+
+---
+
+### Bug 4: Cascade Baseline K Mismatch
+**Where:** `repair/cascade.py` → `run_repair_cascade()`
+
+**Problem:** Cascade always baselined at K=5, but post-promotion the user experienced dynamic K. The "before" metrics didn't match what the user actually saw.
+
+**Fix:** Cascade baseline now uses `_resolve_main_k(query)`. Each strategy also returns `metrics_before_local` probed at its own K, and the cascade uses that for win-decisions instead of the cascade-level baseline.
+
+---
+
+### Bug 5: Empty Ingestion Crash
+**Where:** `controllers/ingestion.py`
+
+**Problem:** `min(sizes)` and `sum(sizes)//len(sizes)` crash on empty PDFs/TXT files.
+
+**Fix:** Guard `if not sizes: return warning`.
+
+---
+
+### Pre-existing (Not Fixed — Low Impact)
+
+| # | Issue | Impact |
+|---|-------|--------|
+| `QueryLog.chunk_ids` | Stores source filenames, not Pinecone IDs | Harmless — repair does fresh lookups |
+| `_resolve_main_k` per-query DB hit | Opens SQLite session per query (~1ms) | Could cache with TTL |
+| `_detect_user_frustration` re-embeds | Embeds last 20 queries on every call | Could cache by `query_log.id` |
+| `answer_query` double Pinecone call | `similarity_search_with_score` + retrieval chain | Could fold scoring into chain |
+| Snapshot rows on success | S2/S3 snapshots persist after resolve | Harmless — forensic audit trail |
 
 ---
 
@@ -367,32 +517,43 @@ erDiagram
 ```
 1. User asks: "What date did Martin Luther nail the 95 Theses?"
 
-2. RETRIEVE: Pinecone returns 5 chunks (score 0.78)
+2. RETRIEVE: _resolve_main_k() → k=3 (short_factual, if promoted) or k=5
+   → Pinecone returns chunks (score 0.78)
    → Chunks discuss Luther's writings in Dec 1521, but NOT the nailing date
 
 3. GENERATE: Mistral says "The text does not provide this information"
 
 4. DETECT: llm_uncertainty + evidence_mismatch triggers → LowRecallEvent created
+   (score_drop uses max adjacent gap — K-invariant)
 
-5. AUTO-WORKER: Event enters the queue → accumulates to 5 → batch starts
+5. AUTO-WORKER: Accumulates to ≥5 pending AND ≥30% ratio → cascade starts
 
-6. DIAGNOSE: general_degradation (multiple triggers, no single cause)
-   → Strategy: reduce_chunk_size (256/50)
-
-7. TIER 1 - RECHUNK:
-   → Re-split same text with 256/50 → score still 0.78 → NO IMPROVEMENT
-   → ROLLBACK (delete new chunks, restore snapshot)
-
-8. TIER 2 - REFORMULATE:
-   → Rephrase: "When was Martin Luther's posting of 95 theses on church door"
-   → Search entire index → finds different chunks but still no date → FAIL
-
-9. TIER 3 - LLM FALLBACK:
-   → Same chunks → gemma3:27b → still can't find date in chunks → FAIL
+6. CASCADE: run_repair_cascade(event_id)
+   Baseline: _resolve_main_k() → K=5 (pre-promotion) or K=3 (post-promotion)
    
-10. RESULT: ROLLED_BACK → cooldown set → will retry next cycle
-    (The date literally isn't in any chunk in the index)
+   S1 — Dynamic K:
+   → classify: "short_factual" → K=3
+   → probe at K=3 (answer generated at same K=3) → NOT RESOLVED
+   
+   S2 — Chunk Size:
+   → diagnose: general_degradation → reduce_chunk_size (350/70)
+   → handle_event(internal_rollback=False, k_override=5)
+   → local baseline at K=5, probe at K=5 → NOT RESOLVED
+   → CASCADE ROLLBACK
+   
+   S3 — Combined:
+   → handle_event(internal_rollback=False, k_override=3)
+   → local baseline at K=3, probe at K=3 → NOT RESOLVED
+   → CASCADE ROLLBACK
+   
+   S4 — Alt LLM (gemma3:27b):
+   → same chunks → skip_improve_check=True
+   → gemma3:27b → _is_non_answer() check → still non-answer → win=False
+   
+   Result: UNFIXABLE ❌ (the date literally isn't in any chunk)
+
+7. PROVENANCE: RepairReport(strategy_used="none") + AdaptationLog written
 ```
 
 > [!TIP]
-> If the answer genuinely doesn't exist in the ingested documents, no repair strategy can fix it. The system correctly identifies this by exhausting all 3 tiers and marking the event for retry/unfixable after 5 attempts.
+> If the answer genuinely doesn't exist in the ingested documents, no repair strategy can fix it. The system correctly identifies this by exhausting all 4 strategies in a single pass and marking the event as `unfixable`.

@@ -7,13 +7,14 @@ from services.llm_factory import get_llm
 def rechunk_semantic(
     text: str,
     source: str,
-    chunk_size: int = 250,
-    chunk_overlap: int = 80,
+    chunk_size: int = 1250,
+    chunk_overlap: int = 200,
 ) -> list[Document]:
     """
     Strategy A — Configurable chunk size with overlap.
-    Default: 250 chars, 80 overlap. The decision engine may pass
-    different values (e.g., 256 for precision, 512 for context).
+    Default: 1250 chars, 200 overlap (matches ingestion baseline).
+    The decision engine may pass different values (e.g., 350 for
+    precision, 1400 for context, 200 for tight precision).
     """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size    = chunk_size,
@@ -26,7 +27,7 @@ def rechunk_semantic(
     )
 
 
-def rechunk_llm(text: str, source: str, chunk_size: int = 250, chunk_overlap: int = 80) -> list[Document]:
+def rechunk_llm(text: str, source: str, chunk_size: int = 1250, chunk_overlap: int = 200) -> list[Document]:
     """
     Strategy B — Ask the LLM to find topic boundaries, split there.
     Use when content mixes multiple distinct topics in one document.
@@ -62,7 +63,7 @@ def rechunk_llm(text: str, source: str, chunk_size: int = 250, chunk_overlap: in
         return rechunk_semantic(text, source, chunk_size, chunk_overlap)
 
 
-def rechunk_entropy(text: str, source: str, chunk_size: int = 250, chunk_overlap: int = 80) -> list[Document]:
+def rechunk_entropy(text: str, source: str, chunk_size: int = 1250, chunk_overlap: int = 200) -> list[Document]:
     """
     Strategy C — Split at sentences with high vocabulary novelty (topic shifts).
     Use when content is long and topics drift gradually without clear headings.

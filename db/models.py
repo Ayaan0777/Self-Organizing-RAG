@@ -128,7 +128,7 @@ class AdaptationLog(Base):
     """
     Full provenance record for every adaptation cycle.
     Records: what was observed → what was decided → what was changed → what resulted.
-    Written by repair/orchestrator.py after each repair attempt.
+    Written by repair/cascade.py after each cascade run.
     """
     __tablename__ = "autorag_adaptation_log"
     id                = Column(Integer, primary_key=True)
@@ -144,3 +144,30 @@ class AdaptationLog(Base):
     rolled_back       = Column(Boolean, default=False)
     cooldown_until    = Column(DateTime, nullable=True)
     created_at        = Column(DateTime, default=datetime.utcnow)
+
+
+class StrategyCounter(Base):
+    """
+    Persists success counts per repair strategy for the ordered cascade.
+    Incremented each time a strategy resolves an event.
+    Used by maybe_promote_dynamic_k() to trigger promotion at threshold.
+    """
+    __tablename__ = "autorag_strategy_counters"
+    id                  = Column(Integer, primary_key=True)
+    strategy            = Column(String(50), unique=True)  # s1_dynamic_k | s2_chunk_size | s3_combined | s4_alt_llm
+    success_count       = Column(Integer, default=0)
+    last_incremented_at = Column(DateTime, nullable=True)
+
+
+class RuntimeFlag(Base):
+    """
+    Boolean flags for one-way promotions.
+    Currently used for: dynamic_k_promoted (Strategy 1 → main pipeline).
+    Read by controllers/retrieval.py on every request; set by repair/cascade.py.
+    """
+    __tablename__ = "autorag_runtime_flags"
+    id     = Column(Integer, primary_key=True)
+    name   = Column(String(80), unique=True)   # e.g. "dynamic_k_promoted"
+    value  = Column(Boolean, default=False)
+    set_at = Column(DateTime, default=datetime.utcnow)
+

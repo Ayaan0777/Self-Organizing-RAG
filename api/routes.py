@@ -2,7 +2,7 @@ from fastapi import APIRouter, UploadFile, File, Query, Form,HTTPException
 from pydantic import BaseModel
 from controllers import ingestion, retrieval, evaluation
 from controllers.evaluation import process_local_evaluation
-from repair.orchestrator import handle_event
+from repair.cascade import run_repair_cascade
 router = APIRouter()
 
 
@@ -69,7 +69,7 @@ async def auto_chunk_endpoint(req: AutoChunkReq):
 # ── Auto-RAG monitoring endpoints ─────────────────────────────
 import json as _json
 from db.session import get_session
-from db.models import QueryLog, LowRecallEvent, RepairReport, AdaptationLog
+from db.models import QueryLog, LowRecallEvent, RepairReport, AdaptationLog, StrategyCounter, RuntimeFlag
 
 
 @router.get("/logs")
@@ -168,20 +168,14 @@ async def evaluate_local_endpoint(
         start_index=start_index
     )
 @router.post("/repair/{event_id}")
-async def trigger_repair_loop(
-    event_id: int,
-    strategy: str = Query("semantic", description="Strategy to use: 'semantic', 'llm', or 'entropy'")
-):
+async def trigger_repair_loop(event_id: int):
     """
-    Triggers the self-healing repair loop for a specific LowRecallEvent.
-    1. Isolates the specific failing chunks
-    2. Re-chunks them using the chosen strategy
-    3. Replaces the old vectors in Pinecone
-    4. Probes the score to verify improvement
+    Triggers the ordered repair cascade for a specific LowRecallEvent.
+    Tries S1 (dynamic K) → S2 (chunk size) → S3 (combined) → S4 (alt LLM).
+    First strategy that resolves the issue wins.
     """
-    result = handle_event(event_id, strategy=strategy)
+    result = run_repair_cascade(event_id)
     
-    # If the orchestrator caught a known error, return a clean 400 Bad Request
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
         
@@ -358,4 +352,42 @@ def get_adaptation_log(limit: int = 50):
         }
         for r in rows
     ]
+
+
+# ── Cascade: Strategy Counters & Runtime Flags ────────────────
+
+@router.get("/strategy-counters")
+def get_strategy_counters():
+    """Returns all strategy success counters for the repair cascade."""
+    s = get_session()
+    try:
+        counters = s.query(StrategyCounter).all()
+        return [
+            {
+                "strategy": c.strategy,
+                "success_count": c.success_count,
+                "last_incremented_at": str(c.last_incremented_at) if c.last_incremented_at else None,
+            }
+            for c in counters
+        ]
+    finally:
+        s.close()
+
+
+@router.get("/runtime-flags")
+def get_runtime_flags():
+    """Returns all runtime flags (e.g., dynamic_k_promoted)."""
+    s = get_session()
+    try:
+        flags = s.query(RuntimeFlag).all()
+        return [
+            {
+                "name": f.name,
+                "value": f.value,
+                "set_at": str(f.set_at) if f.set_at else None,
+            }
+            for f in flags
+        ]
+    finally:
+        s.close()
 

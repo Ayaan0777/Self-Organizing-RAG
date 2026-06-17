@@ -242,27 +242,90 @@ def hallucination_rate(
 
 
 # ══════════════════════════════════════════════════════════════
-#  4. QUESTION CLASSIFIER
+#  4. QUESTION CLASSIFIER — Embedding-based (NLP)
 # ══════════════════════════════════════════════════════════════
 
-# Keywords for classification heuristics
-_FACTUAL_STARTERS = {"who", "what", "when", "where", "which", "name", "list", "define"}
-_COMPLEX_KEYWORDS = {"how", "why", "explain", "describe", "compare", "analyze",
-                     "evaluate", "discuss", "elaborate", "detail"}
-_CROSS_SECTION_KEYWORDS = {"and", "vs", "versus", "between", "relationship",
-                           "difference", "similarities", "contrast", "both"}
+# Prototype queries for each category — the classifier compares incoming
+# queries against these prototypes using cosine similarity.
+# To tune classification, add/edit/remove prototype sentences.
+_CATEGORY_PROTOTYPES = {
+    "short_factual": [
+        "What year did this event happen?",
+        "Who invented the telephone?",
+        "Name the capital of France",
+        "When was the company founded?",
+        "Where is the headquarters located?",
+        "Which element has atomic number 6?",
+        "What is the definition of osmosis?",
+        "List the main components",
+        "How many people were involved?",
+        "What does this term mean?",
+    ],
+    "complex": [
+        "Explain how photosynthesis works in detail",
+        "Describe the process of cellular respiration and its stages",
+        "Why did the Roman Empire decline and fall?",
+        "Analyze the impact of climate change on agriculture",
+        "How does machine learning differ from traditional programming and what are the implications?",
+        "Discuss the advantages and disadvantages of renewable energy",
+        "Elaborate on the causes and consequences of inflation",
+        "Evaluate the effectiveness of this policy",
+        "What are the underlying mechanisms behind this phenomenon?",
+        "Provide a detailed explanation of how this system operates",
+    ],
+    "cross_section": [
+        "Compare X and Y across multiple dimensions",
+        "What is the relationship between A and B?",
+        "How do these two approaches differ from each other?",
+        "Contrast the economic policies of these two countries",
+        "What are the similarities and differences between mitosis and meiosis?",
+        "How does factor A interact with factor B?",
+        "Describe the connection between poverty and education",
+        "What links these two historical events?",
+        "Compare the performance of method A versus method B",
+        "How are these concepts related to each other?",
+    ],
+}
+
+# Cache for prototype embeddings — computed lazily on first call
+_prototype_cache: dict[str, list[np.ndarray]] = {}
+
+
+def _get_prototype_embeddings() -> dict[str, list[np.ndarray]]:
+    """
+    Lazily computes and caches prototype embeddings.
+    Called once on first classify_question() invocation, then reused.
+    """
+    global _prototype_cache
+    if _prototype_cache:
+        return _prototype_cache
+
+    try:
+        for category, prototypes in _CATEGORY_PROTOTYPES.items():
+            _prototype_cache[category] = [
+                _get_embedding(proto) for proto in prototypes
+            ]
+    except Exception:
+        _prototype_cache = {}  # reset on failure
+
+    return _prototype_cache
 
 
 def classify_question(query: str) -> str:
     """
-    Classifies a query into one of three categories to guide strategy selection:
+    Classifies a query into one of three categories using embedding similarity:
 
-    - "short_factual" — Short queries seeking a specific fact (who/what/when/where)
-    - "complex"       — Longer queries requiring explanation or analysis
-    - "cross_section" — Queries spanning multiple topics or documents
+    - "short_factual" — Short queries seeking a specific fact
+    - "complex"       — Queries requiring explanation or analysis
+    - "cross_section" — Queries spanning multiple topics or comparisons
 
-    The classification drives the DECIDE stage: different question types
-    respond best to different chunk sizes and retrieval strategies.
+    Method:
+      1. Embed the incoming query using mxbai-embed-large
+      2. Compare against pre-embedded prototype queries for each category
+      3. Compute mean similarity to each category's prototypes
+      4. Return the category with the highest mean similarity
+
+    Falls back to keyword-based heuristic if embedding fails.
 
     Args:
         query: The user's question.
@@ -273,26 +336,58 @@ def classify_question(query: str) -> str:
     if not query:
         return "short_factual"
 
+    try:
+        proto_embeds = _get_prototype_embeddings()
+        if not proto_embeds:
+            return _classify_question_fallback(query)
+
+        query_emb = _get_embedding(query)
+
+        best_category = "short_factual"
+        best_score = -1.0
+
+        for category, embeddings in proto_embeds.items():
+            # Mean similarity to all prototypes in this category
+            sims = [_cosine_sim(query_emb, proto_emb) for proto_emb in embeddings]
+            mean_sim = float(np.mean(sims))
+
+            if mean_sim > best_score:
+                best_score = mean_sim
+                best_category = category
+
+        return best_category
+
+    except Exception:
+        return _classify_question_fallback(query)
+
+
+# ── Keyword fallback (used when embedding model is unavailable) ──
+_FACTUAL_STARTERS = {"who", "what", "when", "where", "which", "name", "list", "define"}
+_COMPLEX_KEYWORDS = {"how", "why", "explain", "describe", "compare", "analyze",
+                     "evaluate", "discuss", "elaborate", "detail"}
+_CROSS_SECTION_KEYWORDS = {"and", "vs", "versus", "between", "relationship",
+                           "difference", "similarities", "contrast", "both"}
+
+
+def _classify_question_fallback(query: str) -> str:
+    """Keyword-based fallback when embedding model is unavailable."""
     words = query.lower().split()
     word_set = set(words)
     num_words = len(words)
 
-    # Check for cross-section indicators (multi-topic queries)
     cross_section_matches = word_set & _CROSS_SECTION_KEYWORDS
     if len(cross_section_matches) >= 1 and num_words > 8:
         return "cross_section"
 
-    # Check for complex query indicators
     complex_matches = word_set & _COMPLEX_KEYWORDS
     if complex_matches and num_words > 12:
         return "complex"
 
-    # Short factual: short queries or starting with factual keywords
     if num_words <= 10 or (words[0] in _FACTUAL_STARTERS):
         return "short_factual"
 
-    # Default: if > 15 words and has complex keywords, it's complex
     if num_words > 15 and complex_matches:
         return "complex"
 
     return "short_factual"
+

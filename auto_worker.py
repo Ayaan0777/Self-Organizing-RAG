@@ -1,175 +1,127 @@
 """
 Batch-Driven Auto-RAG Self-Healing Daemon
 ============================================================
-Monitors the database queue and executes repairs in batches
-of 5 flagged questions to optimize computational overhead.
+Monitors the database queue and triggers the repair cascade
+when the failure threshold is met.
 
-Uses the full decision engine pipeline:
-  1. Wait until 5 flagged questions accumulate
-  2. For each event: Diagnose → Select Strategy → Execute Repair
-  3. Log batch summary with enhanced metrics (precision, recall, accuracy)
+Trigger condition (BOTH must be true):
+  - Pending count ≥ PENDING_MIN (5)
+  - Pending / total queries ≥ PENDING_RATIO (30%)
+
+Each event gets exactly one cascade pass (S1→S2→S3→S4).
+No retries, no cooldowns — single-pass with unfixable terminal state.
 """
 import time
-import json
 import logging
 from db.session import get_session
 from db.models import LowRecallEvent, QueryLog
-from repair.orchestrator import handle_event
-from detector.decision_engine import (
-    diagnose, select_strategy, check_cooldown, set_cooldown,
-    get_active_config, get_recent_adaptations, STRATEGY_TO_RECHUNK,
-)
 
-BATCH_THRESHOLD = 5
+PENDING_MIN = 5
+PENDING_RATIO = 0.30
 POLL_INTERVAL_SECONDS = 5
-MAX_ATTEMPTS = 5
 
 
 def run_batch_worker():
     print("🚀 [Batch-Worker] Background Daemon initialized...")
-    print(f"📊 Accumulation Mode: Waiting until queue hits {BATCH_THRESHOLD} flagged questions before execution.")
+    print(f"📊 Trigger: ≥{PENDING_MIN} pending events AND ≥{int(PENDING_RATIO*100)}% of total queries flagged.")
     print(f"📡 Monitoring database state every {POLL_INTERVAL_SECONDS} seconds...\n")
 
     while True:
         session = get_session()
         try:
-            # 1. Fetch all unresolved anomalies currently in the queue
-            active_anomalies = (
+            # 1. Count total queries (denominator for ratio)
+            total_queries = session.query(QueryLog).count()
+
+            # 2. Fetch all pending events (unresolved AND not unfixable)
+            pending_events = (
                 session.query(LowRecallEvent)
                 .filter(LowRecallEvent.resolved == False)
                 .filter(LowRecallEvent.unfixable == False)
                 .order_by(LowRecallEvent.timestamp.asc())
                 .all()
             )
+            pending_count = len(pending_events)
 
-            current_queue_count = len(active_anomalies)
+            # 3. Check trigger conditions
+            count_ok = pending_count >= PENDING_MIN
+            ratio_ok = total_queries > 0 and (pending_count / total_queries) >= PENDING_RATIO
 
-            # 2. Only trigger when we have accumulated enough flagged questions
-            if current_queue_count >= BATCH_THRESHOLD:
-                print(f"\n🔥 [THRESHOLD MET] Queue has {current_queue_count} flagged questions! "
-                      f"Starting batch repair for {BATCH_THRESHOLD}...")
+            if count_ok and ratio_ok:
+                ratio_pct = round(pending_count / total_queries * 100, 1)
+                print(f"\n🔥 [THRESHOLD MET] {pending_count} pending events "
+                      f"({ratio_pct}% of {total_queries} queries). "
+                      f"Starting cascade for ALL {pending_count} events...")
 
-                # Slice the batch to process
-                batch_to_process = active_anomalies[:BATCH_THRESHOLD]
+                # Import cascade here to avoid circular imports at module load
+                from repair.cascade import run_repair_cascade
+
                 batch_results = []
 
-                for index, event in enumerate(batch_to_process, start=1):
-                    # CIRCUIT BREAKER: Check max attempts
-                    if event.attempts >= MAX_ATTEMPTS:
-                        logging.warning(
-                            f"🛑 [Batch] Event {event.id} exhausted {MAX_ATTEMPTS} attempts. "
-                            f"Marking UNFIXABLE."
-                        )
-                        event.unfixable = True
-                        session.commit()
-                        continue
+                for index, event in enumerate(pending_events, start=1):
+                    print(f"\n  ⚙️ [{index}/{pending_count}] Processing Event {event.id}...")
 
-                    # COOLDOWN CHECK
-                    if check_cooldown(event):
-                        logging.debug(f"⏳ [Batch] Event {event.id} in cooldown — skipping.")
-                        continue
-
-                    # LOAD QUERY LOG for diagnosis
-                    log = session.query(QueryLog).filter(
-                        QueryLog.id == event.query_log_id
-                    ).first()
-                    if not log:
-                        logging.warning(f"[Batch] Event {event.id} has no query log — skipping.")
-                        continue
-
-                    # DIAGNOSE: Determine root cause from metrics
-                    diag = diagnose(event, log)
-                    print(
-                        f"  ⚙️ [{index}/{BATCH_THRESHOLD}] Event {event.id} | "
-                        f"Root cause: {diag['root_cause']} | "
-                        f"Category: {diag['question_category']} | "
-                        f"Severity: {diag['severity_score']}"
-                    )
-
-                    # SELECT STRATEGY with conflict resolution
-                    recent = get_recent_adaptations(limit=5)
-                    current_config = get_active_config()
-                    strategy, config = select_strategy(diag, current_config, recent)
-                    rechunk_strategy = STRATEGY_TO_RECHUNK.get(strategy, "semantic")
-
-                    # Increment attempt counter
-                    event.attempts += 1
-                    session.commit()
-
-                    # EXECUTE the repair with enhanced metrics
                     try:
-                        result = handle_event(
-                            event.id,
-                            strategy=rechunk_strategy,
-                            config=config,
-                            diagnosis=diag,
-                        )
-
+                        result = run_repair_cascade(event.id)
                         batch_results.append({
                             "event_id": event.id,
-                            "strategy": strategy,
+                            "winning_strategy": result.get("winning_strategy"),
                             "outcome": result.get("outcome", "ERROR"),
+                            "cascade_steps": result.get("cascade_steps", []),
                             "score_before": result.get("score_before"),
                             "score_after": result.get("score_after"),
-                            "precision_before": result.get("precision_before"),
-                            "precision_after": result.get("precision_after"),
-                            "recall_before": result.get("recall_before"),
-                            "recall_after": result.get("recall_after"),
-                            "accuracy_before": result.get("accuracy_before"),
-                            "accuracy_after": result.get("accuracy_after"),
                         })
 
-                        # Refresh event from DB to avoid stale session data
-                        session.expire(event)
-
-                        if result.get("improved"):
-                            print(f"    ✅ Event {event.id} HEALED using {strategy}.")
-                            event.resolved = True
-                            session.commit()
+                        status = result.get("outcome", "ERROR")
+                        winner = result.get("winning_strategy", "none")
+                        if status == "IMPROVED":
+                            print(f"    ✅ Event {event.id} HEALED by {winner}")
+                        elif status == "UNFIXABLE":
+                            print(f"    ❌ Event {event.id} UNFIXABLE (all 4 strategies failed)")
                         else:
-                            status = "ROLLED_BACK" if result.get("rolled_back") else "FAILED"
-                            print(f"    ⚠️ Event {event.id} {status}. Will re-diagnose next cycle.")
-                            event.resolved = False  # Explicitly keep unresolved
-                            set_cooldown(event, session)
+                            print(f"    ⚠️ Event {event.id}: {status}")
 
                     except Exception as loop_err:
                         print(f"    ❌ Error processing Event {event.id}: {str(loop_err)}")
                         batch_results.append({
                             "event_id": event.id,
-                            "strategy": strategy,
                             "outcome": "ERROR",
                             "error": str(loop_err),
                         })
 
                 # ── BATCH SUMMARY ──
                 improved_count = sum(1 for r in batch_results if r.get("outcome") == "IMPROVED")
-                rolled_back_count = sum(1 for r in batch_results if r.get("outcome") == "DEGRADED")
+                unfixable_count = sum(1 for r in batch_results if r.get("outcome") == "UNFIXABLE")
                 error_count = sum(1 for r in batch_results if r.get("outcome") == "ERROR")
 
                 print(f"\n🏁 [Batch Complete] Processed {len(batch_results)} events:")
-                print(f"   ✅ Improved: {improved_count}")
-                print(f"   🔄 Rolled Back: {rolled_back_count}")
-                print(f"   ❌ Errors: {error_count}")
+                print(f"   ✅ Resolved: {improved_count}")
+                print(f"   ❌ Unfixable: {unfixable_count}")
+                print(f"   ⚠️ Errors: {error_count}")
 
-                # Log detailed metrics for each repair
+                # Per-event detail
                 for r in batch_results:
-                    if r.get("precision_before") is not None:
-                        print(
-                            f"   Event {r['event_id']}: "
-                            f"prec={r.get('precision_before', 'N/A')}→{r.get('precision_after', 'N/A')} "
-                            f"recall={r.get('recall_before', 'N/A')}→{r.get('recall_after', 'N/A')} "
-                            f"acc={r.get('accuracy_before', 'N/A')}→{r.get('accuracy_after', 'N/A')} "
-                            f"[{r['outcome']}]"
-                        )
+                    steps = " → ".join(r.get("cascade_steps", []))
+                    print(f"   Event {r['event_id']}: {r.get('outcome')} "
+                          f"| Winner: {r.get('winning_strategy', 'none')} "
+                          f"| Steps: [{steps}]")
 
-                print(f"   Returning to accumulation mode.\n")
+                print(f"   Returning to monitoring mode.\n")
 
             else:
                 # Still accumulating — show heartbeat
-                if current_queue_count > 0:
+                if pending_count > 0:
+                    if total_queries > 0:
+                        ratio_pct = round(pending_count / total_queries * 100, 1)
+                    else:
+                        ratio_pct = 0.0
+                    reasons = []
+                    if not count_ok:
+                        reasons.append(f"count={pending_count}/{PENDING_MIN}")
+                    if not ratio_ok:
+                        reasons.append(f"ratio={ratio_pct}%/{int(PENDING_RATIO*100)}%")
                     print(
-                        f"⏳ Accumulating: {current_queue_count}/{BATCH_THRESHOLD} "
-                        f"flagged questions in queue. Standing by...",
+                        f"⏳ Waiting: {pending_count} pending events, "
+                        f"but threshold not met ({', '.join(reasons)})",
                         end="\r"
                     )
 

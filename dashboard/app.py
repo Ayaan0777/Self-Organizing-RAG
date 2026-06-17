@@ -15,7 +15,7 @@ import streamlit as st
 import pandas as pd
 from db.session import get_session, init_db
 
-from db.models import QueryLog, LowRecallEvent, EvalSnapshot, AdaptationLog, PipelineConfig
+from db.models import QueryLog, LowRecallEvent, EvalSnapshot, AdaptationLog, PipelineConfig, StrategyCounter, RuntimeFlag
 
 init_db()
 
@@ -541,10 +541,12 @@ def render_table(df):
                 val = f'<span style="color:var(--amber);font-weight:600;">MEDIUM</span>'
             elif val == "LOW":
                 val = f'<span style="color:var(--green);">LOW</span>'
-            elif val in ("✓ YES",):
+            elif val in ("✓ YES", "✓ RESOLVED", "✓ IMPROVED"):
                 val = f'<span style="color:var(--green);">{val}</span>'
-            elif val in ("✗ NO",):
+            elif val in ("✗ NO", "✗ PENDING", "✗ DEGRADED"):
                 val = f'<span style="color:var(--muted);">{val}</span>'
+            elif val in ("⊘ UNFIXABLE",):
+                val = f'<span style="color:var(--red);font-weight:600;">{val}</span>'
             cells += f"<td>{val}</td>"
         rows_html += f"<tr>{cells}</tr>"
     html = f"""
@@ -607,17 +609,36 @@ if page == "Overview":
     total    = session.query(QueryLog).count()
     flagged  = session.query(QueryLog).filter(QueryLog.flagged == True).count()
     healthy  = total - flagged
-    resolved = session.query(LowRecallEvent).filter(LowRecallEvent.resolved == True).count()
+    resolved  = session.query(LowRecallEvent).filter(LowRecallEvent.resolved == True).count()
+    unfixable = session.query(LowRecallEvent).filter(LowRecallEvent.unfixable == True).count()
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("TOTAL QUERIES",  total)
     c2.metric("HEALTHY",        healthy)
     c3.metric("FLAGGED",        flagged)
     c4.metric("RESOLVED",       resolved)
+    c5.metric("UNFIXABLE",      unfixable)
 
     flag_rate = round(flagged / total * 100, 1) if total else 0
     res_rate  = round(resolved / flagged * 100, 1) if flagged else 0
-    st.caption(f"FLAG RATE: {flag_rate}%  ·  RESOLUTION RATE: {res_rate}%")
+    st.caption(f"FLAG RATE: {flag_rate}%  ·  RESOLUTION RATE: {res_rate}%  ·  UNFIXABLE: {unfixable}")
+
+    # ── Dynamic K Promotion Status ──
+    dk_flag = session.query(RuntimeFlag).filter(
+        RuntimeFlag.name == "dynamic_k_promoted"
+    ).first()
+    if dk_flag and dk_flag.value:
+        st.markdown(
+            '<div class="status-dot" style="margin:8px 0"><span class="dot dot-green"></span> '
+            'DYNAMIC K PROMOTED — main pipeline uses category-based K selection</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="status-dot" style="margin:8px 0"><span class="dot dot-amber"></span> '
+            'DYNAMIC K NOT YET PROMOTED — main pipeline uses fixed K=5</div>',
+            unsafe_allow_html=True,
+        )
 
 
     term_div()
@@ -662,12 +683,12 @@ if page == "Overview":
         <tr>
             <td><code>low_top_score</code></td>
             <td>Best chunk similarity below floor</td>
-            <td class="thresh">0.45</td>
+            <td class="thresh">0.65</td>
         </tr>
         <tr>
             <td><code>score_drop</code></td>
-            <td>Gap between rank-1 and rank-k too large</td>
-            <td class="thresh">0.30</td>
+            <td>Largest adjacent-rank score gap (K-invariant)</td>
+            <td class="thresh">0.15</td>
         </tr>
         <tr>
             <td><code>llm_uncertainty</code></td>
@@ -677,12 +698,12 @@ if page == "Overview":
         <tr>
             <td><code>semantic_mismatch</code></td>
             <td>Chunks are semantically fragmented</td>
-            <td class="thresh">0.55</td>
+            <td class="thresh">0.70</td>
         </tr>
         <tr>
             <td><code>evidence_mismatch</code></td>
             <td>LLM answer diverges from retrieved context</td>
-            <td class="thresh">0.50</td>
+            <td class="thresh">0.60</td>
         </tr>
         <tr>
             <td><code>user_frustration</code></td>
@@ -980,8 +1001,8 @@ elif page == "Query Diagnostics":
                     term_div()
                     sec_header("FLAGGING ANALYSIS")
                     explanations = {
-                        "low_top_score":    "LOW_TOP_SCORE — best retrieved chunk scored below 0.45",
-                        "score_drop":       "SCORE_DROP — large gap between rank-1 and rank-K scores",
+                        "low_top_score":    "LOW_TOP_SCORE — best retrieved chunk scored below 0.65",
+                        "score_drop":       "SCORE_DROP — largest adjacent-rank score gap exceeds 0.15 (K-invariant)",
                         "llm_uncertainty":  "LLM_UNCERTAINTY — response contains hedging language",
                         "semantic_mismatch":"SEMANTIC_MISMATCH — retrieved chunks cover different topics",
                         "evidence_mismatch":"EVIDENCE_MISMATCH — LLM answer diverges from retrieved context",
@@ -1013,7 +1034,7 @@ elif page == "Flagged Events":
     with col1:
         sev_filter = st.selectbox("FILTER BY SEVERITY", ["ALL", "HIGH", "MEDIUM", "LOW"])
     with col2:
-        res_filter = st.selectbox("FILTER BY RESOLVED", ["ALL", "RESOLVED", "UNRESOLVED"])
+        res_filter = st.selectbox("FILTER BY STATUS", ["ALL", "RESOLVED", "UNRESOLVED", "UNFIXABLE"])
 
     # ── Build filtered query ──
     q = session.query(LowRecallEvent).order_by(LowRecallEvent.timestamp.desc())
@@ -1022,7 +1043,9 @@ elif page == "Flagged Events":
     if res_filter == "RESOLVED":
         q = q.filter(LowRecallEvent.resolved == True)
     elif res_filter == "UNRESOLVED":
-        q = q.filter(LowRecallEvent.resolved == False)
+        q = q.filter(LowRecallEvent.resolved == False, LowRecallEvent.unfixable == False)
+    elif res_filter == "UNFIXABLE":
+        q = q.filter(LowRecallEvent.unfixable == True)
 
     # ── Pagination setup ──
     PAGE_SIZE = 10
@@ -1080,12 +1103,13 @@ elif page == "Flagged Events":
         for r in rows:
             detectors = json.loads(r.triggered_detectors or "[]")
             log       = session.query(QueryLog).filter(QueryLog.id == r.query_log_id).first()
+            status = "✓ RESOLVED" if r.resolved else ("⊘ UNFIXABLE" if r.unfixable else "✗ PENDING")
             data.append({
                 "ID":        r.id,
                 "Query":     (log.query if log else "—"),
                 "Severity":  r.severity,
                 "Detectors": ", ".join(detectors),
-                "Resolved":  "✓ YES" if r.resolved else "✗ NO",
+                "Status":    status,
                 "Time":      str(r.timestamp)[:19],
             })
         render_table(pd.DataFrame(data))
@@ -1125,44 +1149,46 @@ elif page == "Flagged Events":
                 chunks_before_n = report.get("chunks_before") or 0
                 chunks_after_n = report.get("chunks_after") or 0
 
-                # Map strategy to human-friendly explanation
+                # Map strategy to human-friendly explanation (cascade strategies)
                 strategy_info = {
-                    "semantic": {
-                        "icon": "🔀", "label": "SEMANTIC RECHUNKING",
+                    "s1_dynamic_k": {
+                        "icon": "🎯", "label": "S1: DYNAMIC K SELECTION",
                         "color": "var(--cyan)",
-                        "desc": f"Re-split source document using semantic boundaries with adjusted chunk size. "
-                                f"Chunks: {chunks_before_n} → {chunks_after_n}.",
+                        "desc": "Adjusted the number of retrieved chunks (K) based on question category. "
+                                "Short factual → fewer chunks (K=2–4), complex → more (K=5–8), "
+                                "cross-section → most (K=6–10). No Pinecone changes.",
                     },
-                    "llm": {
-                        "icon": "🧠", "label": "LLM-GUIDED CHUNKING",
+                    "s2_chunk_size": {
+                        "icon": "🔀", "label": "S2: CHUNK SIZE VARIATION",
                         "color": "#a78bfa",
-                        "desc": f"Used the LLM to identify natural topic boundaries and split text at "
-                                f"meaningful breakpoints. Chunks: {chunks_before_n} → {chunks_after_n}.",
+                        "desc": f"Rechunked source text with decision-engine recommended config. "
+                                f"Chunks: {chunks_before_n} → {chunks_after_n}. K fixed at 5.",
                     },
-                    "entropy": {
-                        "icon": "📊", "label": "ENTROPY-BASED CHUNKING",
+                    "s3_combined": {
+                        "icon": "⚡", "label": "S3: COMBINED (DYNAMIC K + RECHUNK)",
                         "color": "#f59e0b",
-                        "desc": f"Split at vocabulary novelty peaks — points where the topic shifts. "
+                        "desc": f"Applied both dynamic K selection AND rechunking together. "
                                 f"Chunks: {chunks_before_n} → {chunks_after_n}.",
                     },
-                    "query_reformulation": {
-                        "icon": "🔍", "label": "QUERY REFORMULATION",
-                        "color": "#34d399",
-                        "desc": "Rechunking the same text didn't help, so the query was rephrased "
-                                "using the LLM to find better-matching chunks across the entire index.",
-                    },
-                    "auto_resolve": {
-                        "icon": "✅", "label": "AUTO-RESOLVED (GOOD RETRIEVAL)",
-                        "color": "var(--green)",
-                        "desc": "Retrieval score was already high (≥0.72) and the LLM produced a "
-                                "substantive answer. The flag was due to hedging language, not poor retrieval.",
-                    },
-                    "llm_fallback": {
-                        "icon": "🧠", "label": "LLM FALLBACK (GEMMA3:27B)",
+                    "s4_alt_llm": {
+                        "icon": "🧠", "label": "S4: ALT LLM (GEMMA3:27B)",
                         "color": "#f472b6",
-                        "desc": "Rechunking and query reformulation both failed. Switched to a larger "
-                                "LLM (gemma3:27b, 27B params) which extracted the answer from "
-                                "the same chunks that mistral (7B) couldn't handle.",
+                        "desc": "All retrieval strategies failed. Switched to gemma3:27b (27B params) "
+                                "which extracted the answer from the same chunks that mistral (7B) couldn't handle. "
+                                "No Pinecone changes.",
+                    },
+                    "none": {
+                        "icon": "❌", "label": "UNFIXABLE — ALL 4 STRATEGIES FAILED",
+                        "color": "var(--red)",
+                        "desc": "The cascade exhausted all 4 strategies (Dynamic K → Chunk Size → Combined → Alt LLM) "
+                                "without resolving the issue. The answer likely doesn't exist in the ingested documents.",
+                    },
+                    # Legacy strategies (pre-cascade)
+                    "semantic": {
+                        "icon": "🔀", "label": "SEMANTIC RECHUNKING (LEGACY)",
+                        "color": "var(--cyan)",
+                        "desc": f"Re-split source document using semantic boundaries. "
+                                f"Chunks: {chunks_before_n} → {chunks_after_n}.",
                     },
                 }
 
@@ -1577,20 +1603,55 @@ elif page == "Adaptation Log":
     # ── Summary Stats ──
     total_a = session.query(AdaptationLog).count()
     improved_a = session.query(AdaptationLog).filter(AdaptationLog.outcome == "IMPROVED").count()
+    unfixable_a = session.query(AdaptationLog).filter(AdaptationLog.outcome == "UNFIXABLE").count()
     degraded_a = session.query(AdaptationLog).filter(AdaptationLog.outcome == "DEGRADED").count()
     nochange_a = session.query(AdaptationLog).filter(AdaptationLog.outcome == "NO_CHANGE").count()
     rollback_a = session.query(AdaptationLog).filter(AdaptationLog.rolled_back == True).count()
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("TOTAL", total_a)
     c2.metric("IMPROVED", improved_a)
-    c3.metric("DEGRADED", degraded_a)
-    c4.metric("NO CHANGE", nochange_a)
-    c5.metric("ROLLED BACK", rollback_a)
+    c3.metric("UNFIXABLE", unfixable_a)
+    c4.metric("DEGRADED", degraded_a)
+    c5.metric("NO CHANGE", nochange_a)
+    c6.metric("ROLLED BACK", rollback_a)
 
     if total_a:
         success_rate = round(improved_a / total_a * 100, 1)
-        st.caption(f"SUCCESS RATE: {success_rate}%  ·  ROLLBACK RATE: {round(rollback_a / total_a * 100, 1)}%")
+        st.caption(f"SUCCESS RATE: {success_rate}%  ·  UNFIXABLE: {round(unfixable_a / total_a * 100, 1)}%  ·  ROLLBACK RATE: {round(rollback_a / total_a * 100, 1)}%")
+
+    # ── Strategy Counters ──
+    term_div()
+    sec_header("STRATEGY SUCCESS COUNTERS")
+    counters = session.query(StrategyCounter).order_by(StrategyCounter.success_count.desc()).all()
+    if counters:
+        counter_names = {
+            "s1_dynamic_k": "🎯 S1: Dynamic K",
+            "s2_chunk_size": "🔀 S2: Chunk Size",
+            "s3_combined": "⚡ S3: Combined",
+            "s4_alt_llm": "🧠 S4: Alt LLM",
+        }
+        cols = st.columns(len(counters))
+        for i, c in enumerate(counters):
+            label = counter_names.get(c.strategy, c.strategy.upper())
+            cols[i].metric(label, c.success_count)
+        # Promotion status
+        dk_counter = next((c for c in counters if c.strategy == "s1_dynamic_k"), None)
+        dk_count = dk_counter.success_count if dk_counter else 0
+        if dk_count >= 5:
+            st.markdown(
+                '<div class="status-dot" style="margin:4px 0"><span class="dot dot-green"></span> '
+                'S1 PROMOTED TO MAIN PIPELINE</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div class="status-dot" style="margin:4px 0"><span class="dot dot-amber"></span> '
+                f'S1 PROMOTION: {dk_count}/5 successes needed</div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        st.info("▸ NO STRATEGY COUNTERS — the cascade has not resolved any events yet.")
 
     # ── Timeline Table ──
     term_div()
@@ -1615,16 +1676,30 @@ elif page == "Adaptation Log":
             outcome_display = r.outcome or "—"
             if outcome_display == "IMPROVED":
                 outcome_display = "✓ IMPROVED"
+            elif outcome_display == "UNFIXABLE":
+                outcome_display = "⊘ UNFIXABLE"
             elif outcome_display == "DEGRADED":
                 outcome_display = "✗ DEGRADED"
 
+            # Extract cascade steps from observation
+            cascade_steps = obs.get("cascade_steps", [])
+            steps_display = " → ".join(cascade_steps) if cascade_steps else "—"
+
+            strategy_labels = {
+                "s1_dynamic_k": "S1: Dynamic K",
+                "s2_chunk_size": "S2: Chunk Size",
+                "s3_combined": "S3: Combined",
+                "s4_alt_llm": "S4: Alt LLM",
+                "none": "None (Unfixable)",
+            }
+
             data.append({
                 "Event":     r.event_id,
-                "Strategy":  r.strategy_selected or "—",
+                "Winner":    strategy_labels.get(r.strategy_selected, r.strategy_selected or "—"),
                 "Root Cause": diag.get("root_cause", "—"),
                 "Category":  diag.get("question_category", "—"),
+                "Cascade":   steps_display,
                 "Outcome":   outcome_display,
-                "Rolled Back": "✓ YES" if r.rolled_back else "✗ NO",
                 "Time":      str(r.created_at)[:19],
             })
         render_table(pd.DataFrame(data))
@@ -1642,14 +1717,38 @@ elif page == "Adaptation Log":
             sec_header("OBSERVATION (WHAT WAS SEEN)")
             try:
                 obs = json.loads(selected.observation or "{}")
-                col1, col2, col3 = st.columns(3)
+                col1, col2 = st.columns(2)
                 col1.metric("SCORE BEFORE", obs.get("score_before", "—"))
-                col2.metric("RET. PRECISION", f"{obs['retrieval_precision']:.2%}" if obs.get("retrieval_precision") is not None else "—")
-                col3.metric("HALLUCINATION", f"{obs['hallucination_rate']:.2%}" if obs.get("hallucination_rate") is not None else "—")
+                skipped_s1 = obs.get("skipped_s1", False)
+                col2.metric("S1 SKIPPED", "YES (promoted)" if skipped_s1 else "NO")
                 detectors = obs.get("triggered_detectors", [])
                 if detectors:
                     for d in detectors:
                         st.markdown(f'<div class="flag-reason">▸ {d}</div>', unsafe_allow_html=True)
+                # Cascade steps
+                cascade_steps = obs.get("cascade_steps", [])
+                if cascade_steps:
+                    sec_header("CASCADE EXECUTION")
+                    for step in cascade_steps:
+                        parts = step.split(":")
+                        name = parts[0] if parts else step
+                        result = parts[1] if len(parts) > 1 else ""
+                        if result == "RESOLVED":
+                            st.markdown(
+                                f'<div style="background:rgba(0,255,136,0.06);border-left:3px solid var(--green);'
+                                f'padding:8px 14px;margin:4px 0;border-radius:0 4px 4px 0;'
+                                f'font-family:var(--font-mono);font-size:0.8rem;color:var(--green);">'
+                                f'✅ {name} — RESOLVED</div>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(
+                                f'<div style="background:rgba(255,51,102,0.04);border-left:3px solid var(--red);'
+                                f'padding:8px 14px;margin:4px 0;border-radius:0 4px 4px 0;'
+                                f'font-family:var(--font-mono);font-size:0.8rem;color:var(--red);">'
+                                f'❌ {name} — {result}</div>',
+                                unsafe_allow_html=True,
+                            )
             except Exception:
                 st.code(selected.observation or "No observation data")
 

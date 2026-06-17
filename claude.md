@@ -1,429 +1,492 @@
-# Self-Healing RAG (SH2) — Feature Comparison Checklist
+# CLAUDE.md — Implementation Plan: Ordered Repair Cascade + Dynamic-Retrieval Promotion
 
-> **Purpose:** A structured feature list for comparing this codebase against other Self-Healing / Self-Organising RAG implementations.
-
----
-
-## 1. Architecture & Tech Stack
-
-| Feature | Details |
-|---|---|
-| Framework | FastAPI (Python) |
-| LLM Provider | Ollama (local) — default model: `mistral` |
-| Embedding Model | `mxbai-embed-large` (1024 dims) via Ollama |
-| Vector Store | Pinecone (cloud) with namespace isolation |
-| Database | SQLite via SQLAlchemy ORM |
-| Chunking Library | LangChain `RecursiveCharacterTextSplitter` |
-| Document Loaders | PDF (`PyPDFLoader`), DOCX (`Docx2txtLoader`), TXT (`TextLoader`) |
-| Dashboard | Streamlit (`dashboard/app.py`) |
-| API Prefix | `/api/v1/` |
+This file is a forward-looking implementation plan, not documentation of current
+behavior. It describes the changes to the existing Self-Organising RAG pipeline
+required to satisfy the new spec (ordered 4-strategy single-pass repair, 30%/≥5
+trigger, and Strategy-1 promotion to the main pipeline).
 
 ---
 
-## 2. Auto-Repair (Self-Healing) Pipeline
+## 0. Open Questions (please confirm before I start coding)
 
-### 2.1 Overall Repair Architecture
-
-- [x] **4-Stage pipeline:** `DECIDE → ACT → PROBE → COMMIT/ROLLBACK`
-- [x] **Autonomous background worker** — runs on a sliding window schedule
-- [x] **Rate-based triggering** — not per-query, but batch-based on failure rate
-- [x] **Safe rollback** — old vectors are NEVER permanently lost
-- [x] **Repair reports persisted** to SQLite (`RepairReport` table)
-
-### 2.2 Rate-Based Trigger Mechanism
-
-| Parameter | Value |
-|---|---|
-| Check interval | Every **30 seconds** |
-| Sliding window | Last **50 queries** |
-| Failure rate threshold | **30%** (15/50 flagged triggers repair) |
-| Minimum queries before check | **10** |
-| Evaluation mode | Background healing DISABLED when `ENV=evaluation` |
-
-### 2.3 DECIDE Stage — Repair Strategy Selection
-
-- [x] **Detector-based decisions** (highest priority):
-  - `context_insufficient` → `chunk_size=1500`, `overlap=300` (increase context)
-  - `hallucination_detected` → `chunk_size=400`, `overlap=80` (reduce noise)
-- [x] **Query-complexity-based decisions** (fallback):
-  - Complex query → `chunk_size=1500`, `overlap=300`
-  - Simple query → `chunk_size=400`, `overlap=80`
-  - Medium query → `chunk_size=800`, `overlap=150` (default)
-- [x] **Always different from ingestion** — repair NEVER uses ingestion params (`1250/200`)
-- [x] **Query complexity classification** via regex heuristics:
-  - Complex patterns: `compare`, `difference`, `vs`, `explain`, `describe`, multiple `?`
-  - Simple patterns: `who`, `when`, `where`, `how much/many`
-  - Word count ≥ 15 → complex
-
-### 2.4 BACKUP Stage
-
-- [x] Old vectors fetched from Pinecone **into memory** before any deletion
-- [x] Includes full vector data: `id`, `values` (embeddings), `metadata`
-- [x] Batched fetch (1000 IDs per batch, Pinecone limit)
-
-### 2.5 ACT Stage — Delete → Rechunk → Insert
-
-- [x] Old chunks deleted from Pinecone by vector ID
-- [x] Text re-chunked with DECIDE-selected params
-- [x] New chunks embedded and inserted into Pinecone
-- [x] Rechunking verification logging (old count → new count, new sizes)
-
-### 2.6 PROBE Stage — Score Verification
-
-- [x] Re-runs the original failing query against Pinecone post-repair
-- [x] Returns top-1 similarity score (0.0–1.0)
-- [x] Uses `similarity_search_with_score(query, k=5)`
-- [x] Takes the **max** of top-5 scores as the probe score
-
-### 2.7 COMMIT / ROLLBACK
-
-- [x] **Improvement threshold:** Score must beat original by ≥ **0.05**
-- [x] **COMMIT:** New chunks stay, backup discarded, event marked `resolved=True`
-- [x] **ROLLBACK:** New chunks deleted, old chunks restored from backup via `upsert`, event marked `unfixable=True`
-- [x] Rollback processes in batches (100 vectors per upsert)
-- [x] Rollback success/failure logged
-
-### 2.8 Repair Report Logging
-
-Each repair attempt records:
-- [x] `event_id` — which failure event was repaired
-- [x] `strategy_used` — e.g., `increase_context`, `reduce_noise`, `complex_query`
-- [x] `chunk_size_used` — the chunk_size parameter used
-- [x] `repair_reason` — human-readable reason
-- [x] `chunks_before` / `chunks_after` — count comparison
-- [x] `score_before` / `score_after` — quality comparison
-- [x] `resolved` / `rolled_back` — outcome
-- [x] `duration_ms` — repair duration
-- [x] `timestamp` — when repair happened
-
----
-
-## 3. Retrieval Pipeline
-
-### 3.1 Full Retrieval Flow
-
-```
-Query → Retrieval Gate → Retrieval → Reranking → Dynamic K → Query Reformulation → Answer Generation → Logging → Detection
-```
-
-### 3.2 Retrieval Gating (Pre-Retrieval)
-
-- [x] **Two-tier classification:**
-  1. Fast pattern matching for obvious greetings/chitchat (e.g., `hi`, `hello`, `thanks`)
-  2. LLM classification for ambiguous queries (`RETRIEVE` vs `DIRECT`)
-- [x] Short non-question queries (≤ 2 words, no question words) → direct answer
-- [x] Fallback: defaults to RETRIEVE on any error
-- [x] Direct answers bypass Pinecone entirely — answered by LLM alone
-
-### 3.3 Vector Retrieval
-
-- [x] **Over-fetching:** Fetches `min(k*2, 15)` chunks for Dynamic K to prune
-- [x] Pinecone `similarity_search_with_score` — returns cosine similarity (0–1)
-- [x] Optional **metadata filter** support
-- [x] Namespace isolation
-
-### 3.4 LLM-Based Reranking
-
-- [x] Single batch LLM call (not per-chunk)
-- [x] LLM receives all chunks with previews (first 300 chars) and returns a JSON ranking
-- [x] Robust parsing: handles JSON in markdown code blocks, partial rankings, duplicates
-- [x] Missing indices appended in original order
-- [x] Can be disabled via `rerank=False` parameter
-- [x] Falls back to original order on any failure
-
-### 3.5 Dynamic K Selection
-
-Three-stage algorithm:
-- [x] **Stage 1 — Query Complexity Analysis:**
-  - Comparison/multi-part → K bounds `[4, 10]`
-  - Broad/exploratory → K bounds `[3, 8]`
-  - Specific factual → K bounds `[2, 5]`
-  - Long queries (≥ 15 words) → K bounds `[3, 8]`
-  - Default → K bounds `[3, 6]`
-- [x] **Stage 2 — Absolute Score Pruning:**
-  - Removes chunks with score < **0.25** (noise floor)
-- [x] **Stage 3 — Score Cliff Detection:**
-  - Finds largest drop between consecutive scores > **0.12** threshold
-  - Cuts AFTER the cliff point
-- [x] **Minimum K = 2** (always returns at least 2 chunks)
-- [x] Falls back to `target_k` on failure
-
-### 3.6 Query Reformulation
-
-- [x] Triggers when top-1 score < **0.45**
-- [x] LLM rephrases the query for better vector search matching
-- [x] Max **1 reformulation attempt** (no infinite loops)
-- [x] Only replaces results if rephrased query scores **genuinely better**
-- [x] Falls back to original results on failure
-
-### 3.7 Answer Generation
-
-- [x] LangChain `create_stuff_documents_chain` — single-pass context stuffing
-- [x] Prompt: `"Answer the question based only on the context provided"`
-- [x] Uses Ollama Mistral with `temperature=0.2`
-
----
-
-## 4. Chunking Strategies
-
-### 4.1 Ingestion Chunking
-
-| Parameter | Value |
-|---|---|
-| Method | `RecursiveCharacterTextSplitter` |
-| Chunk Size | **1250 chars** |
-| Chunk Overlap | **200 chars** (~16% of max) |
-| Min Chunk Size | **200 chars** (enforced by merging) |
-| Separators | `\n\n`, `\n`, `. `, `? `, `! `, `; `, `, `, ` `, `""` |
-| Text Cleaning | Regex: collapse `\s+` → single space, strip |
-
-### 4.2 Repair Chunking (Adaptive)
-
-| Strategy | Chunk Size | Overlap | Trigger |
-|---|---|---|---|
-| `increase_context` | **1500** | 300 | `context_insufficient` detector |
-| `reduce_noise` | **400** | 80 | `hallucination_detected` detector |
-| `complex_query` | **1500** | 300 | Query complexity = complex |
-| `simple_query` | **400** | 80 | Query complexity = simple |
-| `default_repair` | **800** | 150 | Fallback |
-
-- [x] **Repair ALWAYS uses different params from ingestion** (never 1250/200)
-- [x] Same `RecursiveCharacterTextSplitter` with same separator hierarchy
-- [x] Min chunk floor: **100 chars** for small chunks (≤400), **150 chars** otherwise
-- [x] All chunk sizes within `mxbai-embed-large`'s 512-token window (1800 chars ≈ 450 tokens max)
-- [x] Metadata tagged with `strategy: "adaptive_repair"`, `repair_chunk_size`, `repair_reason`
-
-### 4.3 Auto-Chunker Module (Standalone)
-
-- [x] Simplified single-strategy chunker using `RecursiveCharacterTextSplitter`
-- [x] Same params as ingestion (1250/200/200)
-- [x] Available via `/api/v1/auto-chunk` endpoint
-- [x] Optional Pinecone ingestion (`ingest: true`)
-
-### 4.4 Advanced Chunking Strategies (Available but not in main pipeline)
-
-- [x] **Semantic Segmentation Chunker:**
-  - Embeds each sentence, finds topic boundaries where consecutive similarity drops below threshold (default 0.65)
-  - Groups sentences between boundaries into chunks
-- [x] **Cluster Chunker:**
-  - Agglomerative clustering on sentence embeddings
-  - Cosine distance matrix with distance threshold (default 0.5)
-  - Preserves original document order within clusters
-- [x] **Adaptive Chunk Sizer:**
-  - Post-processor: merges small chunks (< 200 tokens), splits large chunks (> 2000 tokens)
-  - Token estimation: `len(text) / 4`
-
----
-
-## 5. Failure Detection
-
-### 5.1 Detection Metrics (3 Metrics)
-
-| # | Metric | Method | Threshold | Detector Tag |
-|---|---|---|---|---|
-| 1 | **Retrieval Precision** | Score-based: (a) best chunk < 0.55 OR (b) < 50% of chunks ≥ 0.45 | 0.55 / 0.45 / 50% | `low_retrieval_precision` |
-| 2 | **Context Sufficiency** | LLM judges if context can answer query (lenient: "at least some relevant facts") | Binary YES/NO | `context_insufficient` |
-| 3 | **Hallucination Rate** | LLM checks if answer contradicts context (lenient: ignores supplementary info) | Binary YES/NO | `hallucination_detected` |
-| Bonus | **LLM Uncertainty** | Keyword scan in answer text (14 phrases like "does not mention", "no information") | Phrase match | → `context_insufficient` |
-
-### 5.2 Detection Thresholds
-
-| Parameter | Value |
-|---|---|
-| `RELEVANCE_SCORE_FLOOR` | 0.45 (chunks below this are irrelevant) |
-| `MIN_PRECISION_RATIO` | 0.50 (at least 50% of top-k must be relevant) |
-| `TOP_SCORE_FLOOR` | 0.55 (best chunk score absolute minimum) |
-
-### 5.3 Severity Classification
-
-| Detectors Fired | Severity |
-|---|---|
-| 1 | LOW |
-| 2 | MEDIUM |
-| 3+ | HIGH |
-
-### 5.4 Detection Behavior
-
-- [x] Runs automatically after every query (`run_detectors(log_id)`)
-- [x] Never blocks the response (fire-and-forget)
-- [x] Creates `LowRecallEvent` with triggered detector list
-- [x] Marks `QueryLog.flagged = True`
-- [x] Skipped for direct-answer queries (no retrieval = no detection)
-- [x] Fail-safe: LLM errors in detectors → don't flag (false negatives preferred over false positives)
-
----
-
-## 6. Evaluation Metrics
-
-### 6.1 Answer Quality Metrics
-
-| Metric | Method |
-|---|---|
-| **ROUGE-L** | LCS-based F1 between prediction and ground truth (normalized, lowercased, punctuation-stripped) |
-| **Semantic Similarity** | Cosine similarity between answer embedding and ground truth embedding |
-
-### 6.2 Context Quality Metrics
-
-| Metric | Method |
-|---|---|
-| **Context–Question Similarity** | Mean cosine sim between question embedding and each context chunk embedding |
-| **Context–Ground Truth Similarity** | Mean cosine sim between ground truth embedding(s) and each context chunk embedding |
-| **Best Context–Question Similarity** | Max of per-chunk question similarities |
-| **Best Context–GT Similarity** | Max of per-chunk ground truth similarities |
-
-### 6.3 Per-Query Logged Metrics
-
-| Field | Description |
-|---|---|
-| `top_k_scores` | JSON list of cosine similarity scores for each retrieved chunk |
-| `ctx_q_sim` | Average of top-k scores (context↔question similarity) |
-| `answer_sem_sim` | Semantic similarity between answer and ground truth (set by evaluation) |
-| `latency_ms` | End-to-end query latency in milliseconds |
-| `flagged` | Boolean — whether any detector triggered |
-
-### 6.4 Evaluation Snapshots (Persisted)
-
-| Field | Description |
-|---|---|
-| `namespace` | Pinecone namespace evaluated |
-| `llm` / `embeddings` | Model names used |
-| `rouge_l` | Average ROUGE-L across all questions |
-| `sem_sim` | Average semantic similarity |
-| `ctx_q_sim` | Average context–question similarity |
-| `ctx_gt_sim` | Average context–ground truth similarity |
-| Results CSV | Saved to `results/evaluation_results_{namespace}.csv` |
-
----
-
-## 7. Auto-Indexer (Index Maintenance)
-
-### 7.1 Components
-
-| # | Component | Description |
+| # | Question | My default if you say nothing |
 |---|---|---|
-| 1 | **Staleness Detector** | Samples random vectors, re-embeds text with current model, compares cosine similarity. Drift threshold: **0.95** |
-| 2 | **Partial Re-embedder** | Re-embeds only stale vectors via Pinecone `upsert` (in-place update, no delete) |
-| 3 | **Index Refresher** | Upserts new/changed chunks, detects and deletes orphaned vectors (empty text < 10 chars) |
-| 4 | **Consistency Checker** | Reports total vectors, dimension, metadata integrity %, empty text count, average retrieval score |
-
-### 7.2 Full Refresh Pipeline
-
-```
-Consistency Check → Staleness Detection → Auto Re-embedding → Final Consistency Check
-```
-
-### 7.3 Health Status
-
-| Status | Condition |
-|---|---|
-| `HEALTHY` | Metadata integrity > 90% AND vector count > 0 |
-| `DEGRADED` | Metadata integrity ≤ 90% |
-| `EMPTY` | Vector count = 0 |
+| Q1 | Trigger denominator: "30% of total queries flagged" — lifetime `QueryLog` rows, or a rolling window? | **Lifetime**, constants in `auto_worker.py` make the window swappable later |
+| Q2 | Reuse existing `LowRecallEvent.unfixable` as the "failed all 4 strategies" flag, or add a new `unresolved` column? | **Reuse `unfixable=True`**. Cleaner schema, same meaning |
+| Q3 | Strategy 4 alternate LLM: `services.llm_factory.get_fallback_llm()` → `gemma3:27b`. Use that? | **Yes** |
+| Q4 | Strategy 2 chunk-size source: reuse `detector/decision_engine.diagnose()` to pick the size variant, with K fixed at 5? | **Yes** |
+| Q5 | Delete the legacy in-orchestrator cascade (query-reformulation + llm-fallback + auto-resolve) inside `handle_event()`? | **Yes** — the new orchestrator owns the cascade. Keeping both would double-fire Strategy 4 |
+| Q6 | Promotion direction: once Strategy 1 is promoted to main pipeline, never demote — even if it later regresses? | **Yes, one-way promotion** |
+| Q7 | Counter scope: per-namespace or global? | **Global** (single row per strategy). Easy to upgrade to per-namespace later |
+| Q8 | `RepairReport.strategy_used` is `String(50)` — okay to write values `s1_dynamic_k`, `s2_chunk_size`, `s3_combined`, `s4_alt_llm`? | **Yes** |
 
 ---
 
-## 8. Feedback & Adaptive Strategy
+## 1. Current State Snapshot (so the diff is explicit)
 
-### 8.1 Feedback Loop Analyser
+These are the pieces the plan touches. File paths are clickable.
 
-- [x] **Read-only** — analyses data and suggests changes, never auto-modifies thresholds
-- [x] Reports: detector fire rates, strategy success rates, threshold suggestions, overall health score
-- [x] Health score formula: `flag_score (0-50) + resolution_score (0-50)`
-  - `flag_score = max(0, 50 - flag_rate*100)`
-  - `resolution_score = resolution_rate * 50`
-- [x] Threshold suggestions:
-  - Flag rate > 50% → suggest raising thresholds
-  - Flag rate < 5% → suggest lowering thresholds
-  - Detector fires > 30% → flag for review
-  - Resolution rate < 30% → suggest re-ingestion
-
-### 8.2 Adaptive Strategy Selector
-
-- [x] Analyses historical `RepairReport` outcomes
-- [x] Ranks strategies by: success_rate (primary), avg_improvement (secondary)
-- [x] Default order: `["semantic", "entropy", "llm"]`
-- [x] New/unknown strategies appended at end
-- [x] Falls back to default on no history or errors
+- Per-query path: [controllers/retrieval.py:10](controllers/retrieval.py) — `answer_query()`, hardcoded `k=5`, calls `run_detectors()` after logging.
+- Detector: [detector/detectors.py:143](detector/detectors.py) — `run_detectors()` writes a `LowRecallEvent` and sets `QueryLog.flagged = True`.
+- Background loop: [auto_worker.py:28](auto_worker.py) — polls every 5s, fires repair once `BATCH_THRESHOLD = 5` unresolved events accumulate. Already excludes `unfixable`.
+- Strategy selection: [detector/decision_engine.py](detector/decision_engine.py) — `diagnose()` + `select_strategy()` choose ONE strategy per attempt and re-queue with cooldown. **This is the cascade we're replacing.**
+- Repair execution: [repair/orchestrator.py:358](repair/orchestrator.py) — `handle_event()` does dynamic-K + rechunk + probe + rollback + a hidden secondary cascade (reformulation → fallback LLM). **The hidden cascade gets removed; the orchestrator becomes one strategy step.**
+- Dynamic-K helper: [repair/orchestrator.py:58](repair/orchestrator.py) — `_dynamic_k_selection()` already maps `question_category → K bounds`. Reused as-is for Strategy 1.
+- Rechunk strategies: [repair/chunker.py](repair/chunker.py) — `rechunk_semantic / rechunk_llm / rechunk_entropy`. Reused.
+- Snapshot + rollback: [repair/reembedder.py](repair/reembedder.py) — `reembed()` snapshots before delete; `rollback_from_snapshot()` restores. Reused.
+- Resolution judge: [repair/orchestrator.py:247](repair/orchestrator.py) — `_is_improved()` is the composite check (precision/recall/accuracy + non-answer detection). **Reused unchanged as the "resolved?" oracle for every strategy.**
+- Alternate LLM: [services/llm_factory.py:76](services/llm_factory.py) — `get_fallback_llm()` returns `gemma3:27b`. Strategy 4 uses this.
+- Question classifier: [controllers/metrics.py:314](controllers/metrics.py) — `classify_question()` returns `short_factual | complex | cross_section`. Strategy 1 uses this.
 
 ---
 
-## 9. Data Model (SQLite Tables)
+## 2. New / Changed Files (summary)
 
-| Table | Purpose |
-|---|---|
-| `autorag_query_log` | Every user query with scores, chunks, response, latency, flag status |
-| `autorag_low_recall_events` | Detected failures with triggered detectors, severity, resolution status |
-| `autorag_repair_reports` | Every repair attempt with strategy, score change, duration, outcome |
-| `autorag_eval_snapshots` | Evaluation run summaries with averaged metrics |
-
----
-
-## 10. API Endpoints
-
-| Method | Endpoint | Description |
+| File | Change | Risk |
 |---|---|---|
-| POST | `/api/v1/ingest` | Upload & ingest document (PDF/DOCX/TXT) |
-| POST | `/api/v1/query` | RAG query with reranking, dynamic K, reformulation |
-| POST | `/api/v1/auto-chunk` | Chunk raw text, optionally ingest |
-| POST | `/api/v1/evaluate-local` | Run evaluation with uploaded Q&A dataset |
-| POST | `/api/v1/repair/{event_id}` | Manually trigger repair for a specific event |
-| GET | `/api/v1/logs` | Recent query logs |
-| GET | `/api/v1/events` | Low recall events (unresolved by default) |
-| GET | `/api/v1/repair-reports` | Repair history |
-| GET | `/api/v1/eval-history` | Evaluation snapshots |
-| GET | `/api/v1/index/health` | Index consistency check |
-| GET | `/api/v1/index/staleness` | Stale embedding detection |
-| POST | `/api/v1/index/refresh` | Full auto-indexer refresh |
-| GET | `/api/v1/feedback/analysis` | System health analysis & threshold suggestions |
+| `db/models.py` | **+** add `StrategyCounter` table; **+** add `RuntimeFlag` table (for promotion gate) | Low — additive, `init_db()` handles create-all |
+| `auto_worker.py` | Replace polling logic: count-based trigger (30% AND ≥5 pending), call new orchestrator | Medium — controls when repair fires |
+| `repair/cascade.py` | **NEW** — single-pass ordered cascade: `run_repair_cascade(event_id)` | High — the new heart of the system |
+| `repair/orchestrator.py` | Strip the legacy in-function cascade; keep only "apply one rechunk + probe" as a primitive callable from `cascade.py` | High — careful refactor |
+| `controllers/retrieval.py` | After Strategy-1 promotion: switch hardcoded `k=5` → `_dynamic_k_for_query()` when the runtime flag is set | Medium — affects main user path |
+| `detector/decision_engine.py` | Keep `diagnose()` and `STRATEGY_CONFIGS`; deprecate (do not delete) `select_strategy()` and cooldown logic | Low |
+| `repair/llm_swap.py` | **NEW** — Strategy 4 helper: re-run answer with fallback LLM on existing chunks; judge with `_is_improved()` | Low |
+| `api/routes.py` | **+** read-only endpoints `/strategy-counters` and `/runtime-flags` for the dashboard | Low |
+
+I will **not** rewrite the dashboard. It already reads `RepairReport.strategy_used`, which keeps working.
 
 ---
 
-## 11. Safety & Fault Tolerance
+## 3. Data Model Changes
 
-- [x] **Rollback guarantee:** Old vectors backed up before deletion, restored on failed repair
-- [x] **Fail-safe detectors:** LLM errors in detection → don't flag (avoid false positives)
-- [x] **Graceful fallbacks:** Reranker, Dynamic K, Query Reformulator, Retrieval Gate all fall back to original results on failure
-- [x] **No infinite loops:** Max 1 reformulation attempt
-- [x] **Batch processing:** All Pinecone operations batched (50–1000 per batch)
-- [x] **Non-blocking detection:** Detectors run after response is returned
-- [x] **Evaluation mode:** Background self-healing can be disabled via `ENV=evaluation`
-- [x] **Unfixable marking:** Failed repairs mark events as `unfixable=True` to prevent infinite retry
+### 3a. `StrategyCounter` (new)
+Persists the success counters. Mirrors the existing SQLite pattern (`db/models.py`).
+
+```python
+class StrategyCounter(Base):
+    __tablename__ = "autorag_strategy_counters"
+    id          = Column(Integer, primary_key=True)
+    strategy    = Column(String(50), unique=True)   # s1_dynamic_k | s2_chunk_size | s3_combined | s4_alt_llm
+    success_count = Column(Integer, default=0)
+    last_incremented_at = Column(DateTime, nullable=True)
+```
+
+Why a table, not a JSON file or in-memory dict: the dashboard reads from
+SQLite, the auto-worker writes to SQLite, and the FastAPI process reads on
+startup. Three processes, one shared truth — same pattern as every other
+table here. In-memory would desync between `uvicorn` and `auto_worker.py`.
+
+### 3b. `RuntimeFlag` (new)
+Boolean flags for one-way promotions.
+
+```python
+class RuntimeFlag(Base):
+    __tablename__ = "autorag_runtime_flags"
+    id    = Column(Integer, primary_key=True)
+    name  = Column(String(80), unique=True)   # e.g. "dynamic_k_promoted"
+    value = Column(Boolean, default=False)
+    set_at = Column(DateTime, default=datetime.utcnow)
+```
+
+`controllers/retrieval.answer_query()` reads `dynamic_k_promoted` once per
+request (cheap SQLite read — same session pattern as everything else).
+The auto-worker sets it to `True` when `s1.success_count >= 5`.
+
+### 3c. Reuse existing fields
+- `LowRecallEvent.unfixable = True` → "failed all 4 strategies, do not retry."
+- `LowRecallEvent.resolved = True` → "one of the strategies succeeded."
+- `LowRecallEvent.attempts` → we set this to 1 once per event (single pass).
+- `RepairReport.strategy_used` → exact strategy name that resolved it
+  (`s1_dynamic_k` / `s2_chunk_size` / `s3_combined` / `s4_alt_llm` /
+  `none` if all four failed).
+
+No schema migrations needed for these — `init_db()` create-all handles new
+tables; existing rows keep working.
 
 ---
 
-## 12. Quick Comparison Checklist
+## 4. Repair Trigger (auto_worker.py)
 
-Use this checklist to compare against other RAG implementations:
+### Required behavior
+Repair fires when **both**:
+- Pending count ≥ 5
+- Pending count / total `QueryLog` count ≥ 0.30
 
-| Feature | SH2 | Other |
+"Pending" = `LowRecallEvent.resolved = False AND unfixable = False`.
+
+### Implementation
+Replace the `current_queue_count >= BATCH_THRESHOLD` block in
+`auto_worker.py::run_batch_worker()` with:
+
+```python
+PENDING_MIN = 5
+PENDING_RATIO = 0.30
+
+total_queries = session.query(QueryLog).count()
+pending_events = (
+    session.query(LowRecallEvent)
+    .filter(LowRecallEvent.resolved == False, LowRecallEvent.unfixable == False)
+    .order_by(LowRecallEvent.timestamp.asc())
+    .all()
+)
+pending_count = len(pending_events)
+
+ratio_ok = total_queries > 0 and (pending_count / total_queries) >= PENDING_RATIO
+count_ok = pending_count >= PENDING_MIN
+
+if not (ratio_ok and count_ok):
+    # heartbeat log, sleep, continue
+    ...
+    continue
+
+# Trigger — process EVERY pending event in this batch (not a fixed slice of 5)
+for event in pending_events:
+    from repair.cascade import run_repair_cascade
+    run_repair_cascade(event.id)
+```
+
+Notes:
+- Processing all pending events (not just the first 5) avoids a starvation
+  bug where the queue stays above-threshold forever because events 6+ never
+  get touched.
+- Old `MAX_ATTEMPTS = 5` retry / cooldown logic is gone. Each event gets
+  exactly one cascade pass; `unfixable` is the terminal state.
+- The legacy `select_strategy` / `check_cooldown` / `set_cooldown` calls go
+  away from `auto_worker.py`.
+
+---
+
+## 5. Repair Cascade — `repair/cascade.py` (NEW)
+
+Single entry point, ordered, single-pass, with rollback.
+
+```python
+def run_repair_cascade(event_id: int) -> dict:
+    """
+    Single-pass ordered cascade.
+    Each strategy is tried; the first one that satisfies _is_improved()
+    wins, increments its counter, writes a RepairReport, and returns.
+    All four failing → mark unfixable=True, RepairReport(strategy_used="none").
+    """
+```
+
+### Strategy order (from spec)
+1. `s1_dynamic_k` — vary retrieval K by question category; chunk content unchanged.
+2. `s2_chunk_size` — vary chunk size in Pinecone; K fixed at 5.
+3. `s3_combined` — dynamic K + varied chunk size together.
+4. `s4_alt_llm` — same chunks + K, swap LLM for `gemma3:27b`.
+
+### Pseudocode
+
+```python
+def run_repair_cascade(event_id):
+    session = get_session()
+    event, log = load(event_id)
+    if event.resolved or event.unfixable:
+        return
+    event.attempts = 1   # single pass; field still useful for dashboards
+
+    snapshot_taken = False
+    metrics_before = probe_metrics(log.query, k=5)   # baseline K=5 (or _dynamic_k if promoted)
+
+    # ── Possibly skip S1 if it's been promoted to main pipeline ──
+    skip_s1 = is_flag_set("dynamic_k_promoted")
+
+    cascade = []
+    if not skip_s1:
+        cascade.append(("s1_dynamic_k", run_s1_dynamic_k))
+    cascade.extend([
+        ("s2_chunk_size",   run_s2_chunk_size),
+        ("s3_combined",     run_s3_combined),
+        ("s4_alt_llm",      run_s4_alt_llm),
+    ])
+
+    diagnosis = diagnose(event, log)   # reused from decision_engine
+    winning_strategy = None
+    metrics_after = metrics_before
+
+    for name, fn in cascade:
+        result = fn(event, log, diagnosis, metrics_before)
+        if _is_improved(metrics_before, result["metrics_after"]):
+            winning_strategy = name
+            metrics_after = result["metrics_after"]
+            break
+        # Strategy did not resolve → roll back any Pinecone change it made
+        if result.get("pinecone_touched"):
+            rollback_from_snapshot(event_id, new_chunk_ids=result["new_chunk_ids"])
+
+    if winning_strategy:
+        event.resolved = True
+        increment_counter(winning_strategy)        # +1 to StrategyCounter.success_count
+        if winning_strategy == "s1_dynamic_k":
+            maybe_promote_dynamic_k()              # see §7
+        write_repair_report(event, winning_strategy, metrics_before, metrics_after)
+    else:
+        event.unfixable = True
+        write_repair_report(event, "none", metrics_before, metrics_after)
+
+    session.commit()
+```
+
+### Per-strategy contract (each `fn` returns the same shape)
+
+```python
+{
+    "metrics_after": {top1_score, context_precision, recall, answer_accuracy, answer, chunks, ...},
+    "pinecone_touched": bool,        # True if we replaced vectors and need rollback on fail
+    "new_chunk_ids": list[str],      # only when pinecone_touched
+    "details": dict,                 # for provenance — k_used, chunk_size, llm_used, ...
+}
+```
+
+The same `_probe_metrics()` from `repair/orchestrator.py` builds `metrics_after`.
+The same `_is_improved()` is the universal judge.
+
+### Strategy 1 — `run_s1_dynamic_k`
+- `category = classify_question(log.query)` (or `log.question_category`).
+- `k = _dynamic_k_selection(log.query, category, quick_scores)` — already exists.
+- **No Pinecone change.** Just re-probe at the new K.
+- `pinecone_touched = False`.
+
+### Strategy 2 — `run_s2_chunk_size`
+- Fix K = 5.
+- Use `diagnose()` output to pick `STRATEGY_CONFIGS[recommended_strategy]`:
+  `reduce_chunk_size` / `increase_chunk_size` / `tighten_chunks` /
+  `large_coherent_chunks` / `re_ingest`. These already exist in
+  `decision_engine.py`.
+- Pull the failing chunks via `_get_chunk_ids_for_query(log.query, k=5)`,
+  rechunk with `rechunk_semantic(text, source, chunk_size, chunk_overlap)`.
+- `reembed(..., old_chunk_ids, event_id)` — this also writes the
+  `ChunkSnapshot` for rollback.
+- Probe at K = 5.
+- `pinecone_touched = True`.
+
+### Strategy 3 — `run_s3_combined`
+- Pick K via the same dynamic-K selection.
+- Pick chunk size via the same `diagnose()` recommendation.
+- Same rechunk + reembed + probe path as Strategy 2, but K from Strategy 1.
+- `pinecone_touched = True`.
+
+Edge case: if Strategy 2 just touched Pinecone and was rolled back, Strategy
+3 starts from a clean baseline — the snapshot restore brings the index back
+to pre-S2 state. We must `rollback_from_snapshot` **before** S3 calls
+`reembed` so the snapshot table doesn't keep stale entries.
+
+### Strategy 4 — `run_s4_alt_llm` (`repair/llm_swap.py`)
+- No Pinecone change.
+- Retrieve chunks with current K (5 if not promoted, dynamic if promoted).
+- Build the same prompt template from `controllers/retrieval.answer_query()`
+  but invoke `get_fallback_llm()` (`gemma3:27b`).
+- Replace `answer` in the probe result; reuse `_is_improved()` — the
+  non-answer check catches "still can't answer."
+- `pinecone_touched = False`.
+
+### Rollback guarantee
+Pinecone snapshot/rollback only matters for S2 and S3. The cascade explicitly
+rolls back any failed S2/S3 attempt **before** moving on to the next
+strategy. The "previous retrieval + chunk config" is the original ingestion
+state captured in `ChunkSnapshot` rows keyed by `event_id`.
+
+---
+
+## 6. Counter & Promotion Logic
+
+### Increment
+`increment_counter(strategy_name)` does a single `UPDATE
+autorag_strategy_counters SET success_count = success_count + 1,
+last_incremented_at = now() WHERE strategy = :name`. If the row doesn't
+exist, INSERT it.
+
+### Promotion
+```python
+PROMOTION_THRESHOLD = 5
+
+def maybe_promote_dynamic_k():
+    s1 = get_counter("s1_dynamic_k")
+    if s1.success_count >= PROMOTION_THRESHOLD and not is_flag_set("dynamic_k_promoted"):
+        set_flag("dynamic_k_promoted", True)
+        logging.info("[promotion] Strategy 1 promoted to main pipeline.")
+```
+
+### Main-pipeline switch — `controllers/retrieval.py`
+Replace:
+```python
+docs_with_scores = vector_store.similarity_search_with_score(query, k=5)
+```
+with:
+```python
+k = _resolve_main_k(query)   # helper that reads RuntimeFlag once per request
+docs_with_scores = vector_store.similarity_search_with_score(query, k=k)
+```
+
+```python
+def _resolve_main_k(query: str) -> int:
+    from db.session import get_session
+    from db.models import RuntimeFlag
+
+    s = get_session()
+    try:
+        promoted = (
+            s.query(RuntimeFlag)
+            .filter(RuntimeFlag.name == "dynamic_k_promoted", RuntimeFlag.value == True)
+            .first()
+        )
+    finally:
+        s.close()
+
+    if not promoted:
+        return 5
+
+    # Promoted path — classify and pick dynamic K
+    from controllers.metrics import classify_question
+    from repair.orchestrator import _dynamic_k_selection
+    category = classify_question(query)
+    return _dynamic_k_selection(query, category, scores=None)  # no scores yet pre-retrieval
+```
+
+Note: `_dynamic_k_selection` already gracefully degrades when `scores` is
+`None` — it returns the category midpoint (see [repair/orchestrator.py:81](repair/orchestrator.py)).
+
+### Skip-S1-after-promotion
+Cascade reads the same flag before building its strategy list. Test plan
+below covers both branches.
+
+---
+
+## 7. Detector / Decision-Engine Cleanup
+
+Keep `diagnose()` (Strategy 2/3 need it). **Deprecate but do not delete**:
+- `select_strategy()` — no longer used; mark deprecated in a one-line module docstring at the top.
+- `check_cooldown()`, `set_cooldown()`, `LowRecallEvent.cooldown_until`/`last_repair_at` — single-pass cascade has no cooldown concept. Mark deprecated; remove call sites; leave columns NULL.
+
+Rationale for leaving the columns: avoiding a destructive migration. The
+project explicitly uses `init_db()` create-all, not Alembic.
+
+---
+
+## 8. Provenance (still written, simpler shape)
+
+For each cascade run we write:
+- **One `RepairReport`** with `strategy_used` = winning strategy or `"none"`,
+  plus `score_before / score_after / precision_before / precision_after /
+  recall_before / recall_after / accuracy_before / accuracy_after /
+  chunks_before_text / chunks_after_text / dynamic_k`. Same columns the
+  dashboard already reads.
+- **One `AdaptationLog`** per cascade run (not per strategy attempt) with:
+  - `observation` = `{ "triggered_detectors": [...], "cascade_steps": ["s1_dynamic_k:NOT_IMPROVED", "s2_chunk_size:NOT_IMPROVED", "s3_combined:IMPROVED"] }`
+  - `strategy_selected` = winner (or `"none"`)
+  - `outcome` = `IMPROVED` / `DEGRADED` / `NO_CHANGE`
+  - `rolled_back` = True if any intermediate S2/S3 was rolled back, regardless of final outcome.
+
+The legacy multi-AdaptationLog-per-event pattern goes away — one row per
+cascade pass is enough and keeps the dashboard's "recent adaptations" feed
+readable.
+
+---
+
+## 9. Step-by-Step Execution Order (the actual coding sequence)
+
+1. **DB model additions** — `StrategyCounter`, `RuntimeFlag` in `db/models.py`. Restart `uvicorn` to let `init_db()` create them. (No code path uses them yet — safe to ship alone.)
+2. **`repair/cascade.py`** — write the orchestrator skeleton with stubs for each strategy (returning unchanged metrics so cascade always falls through to `unfixable`). Wire `RepairReport` + `AdaptationLog` writes. Unit-feasibility check: run against a known flagged event manually via an ad-hoc script.
+3. **Strategy 1** — implement `run_s1_dynamic_k` using `_dynamic_k_selection` + `_probe_metrics`. No Pinecone writes. Test with a query you know is borderline.
+4. **Strategy 2** — implement `run_s2_chunk_size`. Reuse `_get_chunk_ids_for_query`, `rechunk_semantic`, `reembed`. Confirm rollback path with a deliberately bad config (size=50).
+5. **Strategy 3** — combine 1+2. Add explicit pre-rollback before calling `reembed` so S3 doesn't double-snapshot.
+6. **Strategy 4** — `repair/llm_swap.py` + integration. Verify `get_fallback_llm()` actually loads `gemma3:27b` locally before relying on it (`ollama list`).
+7. **Trigger logic in `auto_worker.py`** — switch `BATCH_THRESHOLD` to the count+ratio gate. Remove old per-event diagnose/select calls; replace with `run_repair_cascade(event.id)`.
+8. **Counters + promotion** — `maybe_promote_dynamic_k()` in cascade; `_resolve_main_k` in `controllers/retrieval.py`. Test: artificially set `StrategyCounter.success_count = 5`, restart uvicorn, hit `/query`, confirm `k` is dynamic.
+9. **Strip legacy `handle_event` cascade** — remove `auto_resolve`, query-reformulation, and llm-fallback blocks. Leave the function as a single "rechunk + probe + rollback" primitive used by S2/S3.
+10. **Deprecate `select_strategy / check_cooldown / set_cooldown`** — add deprecation docstrings; delete call sites in `auto_worker.py`.
+11. **Read-only endpoints** for `/strategy-counters` and `/runtime-flags` in `api/routes.py`. Useful for the dashboard and for debugging.
+12. **Smoke test end-to-end** — see §10.
+
+I'll mark each step with TaskCreate/TaskUpdate when I begin coding so progress
+is visible per file.
+
+---
+
+## 10. Verification Plan (manual, no test suite exists)
+
+Prereqs: `ollama serve` running with `mistral` and `gemma3:27b` pulled,
+Pinecone credentials in `.env`, fresh `db/autorag.db` (or `python
+db/clear_db.py`).
+
+1. **Trigger gate**
+   - Run `uvicorn main:app --reload` and `python auto_worker.py` in two terminals.
+   - Send 10 queries: 7 healthy, 3 deliberately weird (likely to flag).
+   - Confirm cascade does **not** fire (3/10 = 30% but < 5 minimum).
+   - Send 3 more weird queries (6/13 = 46%, ≥5). Cascade should fire.
+2. **S1 wins**
+   - Pick a flagged complex query where K=5 misses context. S1 should resolve it; `StrategyCounter.s1_dynamic_k.success_count` increments by 1.
+3. **S2 wins after S1 fails**
+   - Send a short-factual query that flagged because chunks are too large. S1 won't help (K change doesn't shrink chunks); S2 should resolve via `reduce_chunk_size`.
+4. **S3 wins**
+   - Construct a cross-section query that needs both K bump and `large_coherent_chunks`. Verify S1 and S2 fail individually but S3 succeeds.
+5. **S4 wins**
+   - Find a query where chunks already contain the answer but `mistral` says "I don't know." S1/S2/S3 should fail; S4 (`gemma3:27b`) should produce a real answer. Confirm no Pinecone writes happened on S4.
+6. **All fail → unfixable**
+   - Ask a question completely outside the ingested corpus. All 4 strategies fail; event marked `unfixable=True`; `RepairReport.strategy_used = "none"`.
+7. **Promotion**
+   - Repeat Test #2 five times with different queries (or `UPDATE
+     autorag_strategy_counters SET success_count = 5 WHERE strategy =
+     's1_dynamic_k';`). Restart `uvicorn`. Confirm:
+     - `/api/v1/query` now uses dynamic K (check logs / `/strategy-counters`).
+     - Cascade for the next flagged event **skips** S1 and starts at S2.
+8. **Rollback safety**
+   - Force S2 to pick `chunk_size=50` via a debug override. S2 must roll back; index hash before vs. after must match. Subsequent S3 attempt must see the original chunks, not the bad S2 output.
+
+---
+
+## 11. What This Plan Deliberately Does NOT Do
+
+- **No retry loop.** Each event gets exactly one cascade pass. If all four
+  fail, the event is `unfixable` forever. The user explicitly asked for
+  single-pass.
+- **No demotion.** Once `dynamic_k_promoted` flips True, it stays True.
+- **No promotion of S2/S3/S4** into the main pipeline. Only S1 is eligible
+  per spec.
+- **No dashboard changes.** The existing dashboard keeps working because
+  `RepairReport` columns are unchanged.
+- **No new metric**. Resolution = `_is_improved()` everywhere. No new
+  threshold knobs in `config.py`.
+- **No schema migrations** beyond two additive tables. Existing rows and
+  columns are untouched (some are deprecated, not dropped).
+
+---
+
+## 12. Risks & Mitigations
+
+| Risk | Likelihood | Mitigation |
 |---|---|---|
-| Self-healing repair pipeline | ✅ | |
-| Automatic failure detection (3 metrics) | ✅ | |
-| Rollback on failed repair | ✅ | |
-| Rate-based batch repair triggering | ✅ | |
-| Adaptive chunk sizing during repair | ✅ | |
-| Query complexity → chunk size mapping | ✅ | |
-| Detector-driven repair strategy | ✅ | |
-| LLM-based reranking | ✅ | |
-| Dynamic K selection (3-stage) | ✅ | |
-| Query reformulation on poor retrieval | ✅ | |
-| Retrieval gating (skip retrieval for chitchat) | ✅ | |
-| Embedding staleness detection | ✅ | |
-| Partial re-embedding (upsert, no wipe) | ✅ | |
-| Index consistency checking | ✅ | |
-| Orphaned vector cleanup | ✅ | |
-| Feedback loop with threshold suggestions | ✅ | |
-| Adaptive strategy ordering from history | ✅ | |
-| ROUGE-L evaluation | ✅ | |
-| Semantic similarity evaluation | ✅ | |
-| Context relevance metrics | ✅ | |
-| Per-query logging with full metadata | ✅ | |
-| Repair report with before/after scores | ✅ | |
-| Evaluation history persistence | ✅ | |
-| Health score (0–100) | ✅ | |
-| Semantic segmentation chunking | ✅ (module) | |
-| Agglomerative clustering chunking | ✅ (module) | |
-| Minimum chunk size enforcement | ✅ | |
-| Multi-format document support (PDF/DOCX/TXT) | ✅ | |
-| Namespace-based data isolation | ✅ | |
-| Dashboard (Streamlit) | ✅ | |
+| `_is_improved()` is too strict and every strategy "fails" → flood of `unfixable` | Medium | Keep the existing thresholds; if real-world false-negatives surface, relax in one place (single source of truth) |
+| `gemma3:27b` not pulled locally → S4 always errors | High on a fresh install | `repair/llm_swap.py` catches the exception, returns unchanged metrics → S4 just "fails" cleanly; cascade ends in `unfixable`. Document the prereq in CLAUDE.md commands section. |
+| Pinecone snapshot table grows without bound after many unfixable events | Low | Add a cleanup query in `auto_worker.py` that deletes `ChunkSnapshot` rows older than 7 days, or for events that are now `unfixable=True` and have nothing to roll back to |
+| Counter race between `auto_worker.py` and a future parallel worker | Low | The single-worker model is unchanged. If multi-worker is added later, switch to `UPDATE ... WHERE` atomic counter SQL (already proposed) |
+| Lifetime ratio dominates after one bad day, blocking all future repairs | Medium | The "open question" Q1 — if you say rolling window, switch denominator to last-N or last-T |
+
+---
+
+## 13. Quick Reference — Where Each Spec Bullet Lands
+
+| Spec section | Lives in |
+|---|---|
+| §1 Initial baseline K=5 | `controllers/retrieval.py::_resolve_main_k` (returns 5 when flag unset) |
+| §2 Trigger (≥5 AND ≥30%) | `auto_worker.py::run_batch_worker` |
+| §2 Exclude `unfixable` from count | Same query, `unfixable == False` filter |
+| §3 Strategy order | `repair/cascade.py::run_repair_cascade` |
+| §3 Strategy 1 (dynamic K) | `repair/cascade.run_s1_dynamic_k` (reuses `_dynamic_k_selection`) |
+| §3 Strategy 2 (chunk size, K=5) | `repair/cascade.run_s2_chunk_size` (reuses `diagnose` + `rechunk_semantic`) |
+| §3 Strategy 3 (combined) | `repair/cascade.run_s3_combined` |
+| §3 Strategy 4 (alt LLM) | `repair/cascade.run_s4_alt_llm` (`get_fallback_llm`) |
+| §3 Counter increments | `repair/cascade.increment_counter` → `StrategyCounter` table |
+| §3 Resolved check | `repair/orchestrator._is_improved` (reused) |
+| §3 Single pass + mark unresolved | Cascade sets `unfixable=True` when all four fail |
+| §3 Rollback to previous state | `repair/reembedder.rollback_from_snapshot` (already exists, called between failed S2/S3 attempts) |
+| §4 Promotion threshold ≥5 | `repair/cascade.maybe_promote_dynamic_k` → `RuntimeFlag("dynamic_k_promoted")` |
+| §4 Skip S1 after promotion | Cascade reads flag at the top of `run_repair_cascade` |
+| §4 Main pipeline uses dynamic K | `controllers/retrieval._resolve_main_k` |
+| §4 Only S1 promoted | Hard-coded — no other strategy ever sets a `*_promoted` flag |
+
+---
+
+**Awaiting answers on Q1–Q8 before I start editing code.** If you say "go
+with the defaults," I'll start at Step §9.1 (DB model additions).

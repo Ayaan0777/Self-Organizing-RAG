@@ -1,19 +1,24 @@
 """
 Decision Engine — Stage 3 (DECIDE)
 ====================================
-Metric-driven strategy selection that replaces the fixed waterfall.
+Metric-driven diagnosis that analyzes failures and recommends chunk configs.
 
-Components:
+Active Components:
   1. diagnose()          — Analyzes which metrics failed and determines root cause
-  2. select_strategy()   — Picks the best remediation strategy considering
-                           priority, conflicts, and cooldown
-  3. check_cooldown()    — Prevents oscillation by enforcing wait periods
+  2. STRATEGY_CONFIGS    — Maps strategies to chunk size/overlap parameters
+  3. get_active_config() — Reads current PipelineConfig from DB
+  4. save_new_config()   — Persists new PipelineConfig
 
-Decision Rules:
-  Low precision on short factual Qs  → reduce_chunk_size  (chunk 512→256)
-  Insufficient context on complex Qs → increase_chunk_size (chunk 250→512)
-  Cross-section retrieval failures   → large_coherent_chunks (chunk 1024+)
-  High hallucination rate            → tighten_chunks (chunk→200, low overlap)
+DEPRECATED (replaced by repair/cascade.py single-pass cascade):
+  - select_strategy()  — No longer used; cascade order is fixed S1→S2→S3→S4
+  - check_cooldown()   — No longer used; single-pass has no cooldown concept
+  - set_cooldown()     — No longer used; single-pass has no cooldown concept
+
+Diagnosis Rules:
+  Low precision on short factual Qs  → reduce_chunk_size  (350/70)
+  Insufficient context on complex Qs → increase_chunk_size (1400/250)
+  Cross-section retrieval failures   → large_coherent_chunks (1700/300)
+  High hallucination rate            → tighten_chunks (200/40)
   Stale content drift                → re_ingest (trigger auto_indexer)
 """
 import json
@@ -28,28 +33,28 @@ from db.models import QueryLog, LowRecallEvent, AdaptationLog, PipelineConfig
 # Each strategy maps to a recommended chunk configuration change.
 STRATEGY_CONFIGS = {
     "reduce_chunk_size": {
-        "chunk_size": 256,
-        "chunk_overlap": 50,
+        "chunk_size": 350,
+        "chunk_overlap": 70,
         "chunk_strategy": "semantic",
-        "description": "Smaller chunks to reduce dilution on short factual queries",
+        "description": "Moderate shrink below ingestion baseline for short factual queries",
     },
     "increase_chunk_size": {
-        "chunk_size": 512,
-        "chunk_overlap": 120,
+        "chunk_size": 1400,
+        "chunk_overlap": 250,
         "chunk_strategy": "semantic",
-        "description": "Larger chunks with more overlap for complex multi-part queries",
+        "description": "Grow above ingestion baseline for complex multi-part queries",
     },
     "large_coherent_chunks": {
-        "chunk_size": 1024,
-        "chunk_overlap": 200,
+        "chunk_size": 1700,
+        "chunk_overlap": 300,
         "chunk_strategy": "semantic",
-        "description": "Very large chunks to preserve cross-paragraph coherence",
+        "description": "Maximum expansion to preserve cross-paragraph coherence",
     },
     "tighten_chunks": {
         "chunk_size": 200,
         "chunk_overlap": 40,
         "chunk_strategy": "semantic",
-        "description": "Tight, precise chunks to minimize noise and hallucination",
+        "description": "Maximum shrink for tight, precise chunks to minimize hallucination",
     },
     "re_ingest": {
         "chunk_size": None,   # keep current
@@ -211,6 +216,10 @@ def select_strategy(
     recent_adaptations: list = None,
 ) -> tuple:
     """
+    DEPRECATED: No longer used by the repair pipeline.
+    The ordered cascade in repair/cascade.py now handles strategy ordering.
+    Kept for backward compatibility and manual testing.
+
     Selects the best strategy considering:
       1. The diagnosis recommendation
       2. Conflict resolution — don't do the opposite of what we just did
@@ -276,8 +285,8 @@ def _get_config_dict(strategy: str, current_config: dict = None) -> dict:
     config = STRATEGY_CONFIGS.get(strategy, STRATEGY_CONFIGS["reduce_chunk_size"])
     if strategy == "re_ingest" and current_config:
         return {
-            "chunk_size": current_config.get("chunk_size", 250),
-            "chunk_overlap": current_config.get("chunk_overlap", 80),
+            "chunk_size": current_config.get("chunk_size", 1250),
+            "chunk_overlap": current_config.get("chunk_overlap", 200),
             "chunk_strategy": current_config.get("chunk_strategy", "semantic"),
         }
     return {
@@ -293,6 +302,11 @@ def _get_config_dict(strategy: str, current_config: dict = None) -> dict:
 
 def check_cooldown(event, session=None) -> bool:
     """
+    DEPRECATED: No longer used by the repair pipeline.
+    The single-pass cascade has no cooldown concept — each event
+    gets exactly one cascade pass, then is marked resolved or unfixable.
+    Kept for backward compatibility.
+
     Returns True if the event is still in a cooldown period,
     meaning we should SKIP this event and not attempt repair yet.
 
@@ -309,7 +323,13 @@ def check_cooldown(event, session=None) -> bool:
 
 
 def set_cooldown(event, session, cooldown_seconds: int = None):
-    """Sets a cooldown period on an event after a repair attempt."""
+    """
+    DEPRECATED: No longer used by the repair pipeline.
+    The single-pass cascade has no cooldown concept.
+    Kept for backward compatibility.
+
+    Sets a cooldown period on an event after a repair attempt.
+    """
     seconds = cooldown_seconds or DEFAULT_COOLDOWN_SECONDS
     event.cooldown_until = datetime.utcnow() + timedelta(seconds=seconds)
     event.last_repair_at = datetime.utcnow()
@@ -344,11 +364,11 @@ def get_active_config(namespace: str = None) -> dict:
                 "namespace": config.namespace,
             }
 
-        # Default config if none exists
+        # Default config if none exists — matches ingestion baseline
         return {
             "id": None,
-            "chunk_size": 250,
-            "chunk_overlap": 80,
+            "chunk_size": 1250,
+            "chunk_overlap": 200,
             "chunk_strategy": "semantic",
             "namespace": namespace,
         }

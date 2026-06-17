@@ -156,9 +156,12 @@ def _probe_metrics(query: str, ground_truths: list = None,
         # Recall: are all ground truths covered by at least one chunk?
         recall = retrieval_recall_at_k(chunks, ground_truths)
 
-        # Answer Accuracy: generate answer and compare to ground truth
+        # Answer Accuracy: generate answer and compare to ground truth.
+        # Pass k explicitly so the answer is generated from the SAME chunks
+        # we measured precision/recall against (without this, the answer
+        # would use _resolve_main_k's K — different from probe K post-promotion).
         try:
-            rag_result = generate_answer_only(query, namespace)
+            rag_result = generate_answer_only(query, namespace, k=k)
             answer = rag_result.get("answer", "")
 
             emb_model = get_embeddings()
@@ -188,9 +191,10 @@ def _probe_metrics(query: str, ground_truths: list = None,
         }
     else:
         # Still generate the answer even without ground truths — needed
-        # for storing the resolved_answer in the repair report.
+        # for storing the resolved_answer in the repair report. Pass k so
+        # the answer comes from the same K as the chunks we just measured.
         try:
-            rag_result = generate_answer_only(query, namespace)
+            rag_result = generate_answer_only(query, namespace, k=k)
             answer = rag_result.get("answer", "")
         except Exception as e:
             logging.warning(f"[probe] answer generation failed (no GT path): {e}")
@@ -339,15 +343,20 @@ def _get_chunk_ids_for_query(query: str, namespace: str = None, k: int = 5) -> t
 
 def _get_ground_truths_for_query(query_log) -> list:
     """
-    Attempts to retrieve ground-truth answers for a query.
-    Uses the answer_sem_sim presence as a signal that eval was run with GT.
-    Falls back to empty list if no ground truth is available.
+    Returns ground-truth answers for a query, or [] if none are available.
+
+    Previously this returned [query_log.llm_response] when answer_sem_sim
+    was populated, treating the previous LLM answer as a "ground truth".
+    That was wrong: the LLM answer for a flagged query is the BAD answer
+    we're trying to repair. Comparing repair results against it produced
+    meaningless precision/recall numbers.
+
+    Real ground truths only exist when an evaluation run supplied them.
+    Until they're persisted per-query (currently the eval pipeline doesn't
+    write them into the DB), return [] and let the probe take the no-GT
+    path. That keeps win-decisions honest — based on retrieval score and
+    non-answer detection, not on phantom ground truths.
     """
-    # If we have a stored ground-truth semantic similarity, the eval was run
-    # with ground truth — try to find it from the original answer
-    # For now, use the LLM response as a proxy reference when answer_sem_sim exists
-    if query_log.answer_sem_sim is not None and query_log.llm_response:
-        return [query_log.llm_response]
     return []
 
 
@@ -360,27 +369,34 @@ def handle_event(
     strategy: str = "semantic",
     config: dict = None,
     diagnosis: dict = None,
+    internal_rollback: bool = True,
+    k_override: int = None,
 ) -> dict:
     """
-    SAFE repair loop with rollback and provenance for one LowRecallEvent:
-      1. Load the event and its original failing query
-      2. Find the specific chunk IDs that were retrieved (poorly)
-      3. Probe BEFORE metrics (precision, recall, accuracy, top-1)
-      4. Rechunk with DYNAMIC config from the decision engine
-      5. Snapshot + replace chunks (safe — rollback-enabled)
-      6. Probe AFTER metrics
-      7. ROLLBACK if metrics degraded (composite check)
-      8. Write RepairReport + AdaptationLog (full provenance)
+    Rechunk + reembed + probe primitive for one LowRecallEvent.
+
+      1. Load event + failing query
+      2. Pick K (k_override if given, else dynamic K from question category)
+      3. Probe BEFORE metrics at chosen K
+      4. Rechunk with given chunk config + strategy
+      5. Replace chunks in Pinecone with snapshot for rollback
+      6. Probe AFTER metrics at chosen K
+      7. If internal_rollback=True (legacy): judge with _is_improved and roll
+         back on failure.
+         If internal_rollback=False (cascade-owned): return raw post-rechunk
+         metrics; the caller decides whether to keep or roll back.
 
     Args:
         event_id: ID of the LowRecallEvent to repair.
         strategy: Rechunking strategy name ("semantic", "llm", "entropy").
-        config: Dynamic chunk config from decision engine:
-                {"chunk_size": int, "chunk_overlap": int, "chunk_strategy": str}
-        diagnosis: Diagnosis dict from decision engine (for provenance logging).
-
-    SAFETY: Only the specific failing chunks are replaced.
-    If repair degrades metrics, it is automatically rolled back.
+        config: {"chunk_size": int, "chunk_overlap": int, "chunk_strategy": str}.
+        diagnosis: Diagnosis dict from decision engine (for question_category).
+        internal_rollback: When True (default), self-judges and self-restores.
+            When False, returns raw post-rechunk metrics; caller owns rollback.
+            The cascade in repair/cascade.py uses False so it can compare each
+            strategy on equal terms before deciding to commit or revert.
+        k_override: When set, use this K instead of the category-based dynamic K.
+            Strategy 2 in the cascade pins this to 5.
     """
     session = get_session()
     t0      = time.time()
@@ -404,21 +420,24 @@ def handle_event(
         ground_truths = _get_ground_truths_for_query(log)
         has_gt = len(ground_truths) > 0
 
-        # ── DYNAMIC K: select optimal K based on question category ──
+        # ── PICK K: k_override (S2) or category-based dynamic K ──
         q_category = diagnosis.get("question_category") or log.question_category or "unknown"
-        # First do a quick fetch to get scores for cliff detection
-        vs_quick = get_vector_store()
-        quick_results = vs_quick.similarity_search_with_score(log.query, k=15)
-        quick_scores = [round(float(s), 4) for _, s in quick_results]
-        dynamic_k = _dynamic_k_selection(log.query, q_category, quick_scores)
+        if k_override is not None:
+            k_used = k_override
+            logging.info(
+                f"[repair] Event {event_id} | K override={k_used} (category={q_category})"
+            )
+        else:
+            vs_quick = get_vector_store()
+            quick_results = vs_quick.similarity_search_with_score(log.query, k=15)
+            quick_scores = [round(float(s), 4) for _, s in quick_results]
+            k_used = _dynamic_k_selection(log.query, q_category, quick_scores)
+            logging.info(
+                f"[repair] Event {event_id} | Dynamic K={k_used} (category={q_category})"
+            )
 
-        logging.info(
-            f"[repair] Event {event_id} | Dynamic K={dynamic_k} "
-            f"(category={q_category})"
-        )
-
-        # ── PROBE BEFORE: Measure current metrics with dynamic K ──
-        metrics_before = _probe_metrics(log.query, ground_truths, k=dynamic_k)
+        # ── PROBE BEFORE: Measure current metrics at chosen K ──
+        metrics_before = _probe_metrics(log.query, ground_truths, k=k_used)
         score_before = metrics_before["top1_score"]
         chunks_before_text = metrics_before.get("chunks", [])
 
@@ -430,57 +449,9 @@ def handle_event(
             f"accuracy={metrics_before.get('answer_accuracy', 'N/A')}"
         )
 
-        # ══════════════════════════════════════════════════════════
-        #  AUTO-RESOLVE: High-score events with good answers
-        # ══════════════════════════════════════════════════════════
-        # If retrieval is already good (score >= 0.72) and the LLM can produce
-        # a real answer, the flag was for LLM uncertainty — not poor retrieval.
-        # Auto-resolve without rechunking.
-        if score_before >= 0.72 and not has_gt:
-            answer_before = metrics_before.get("answer", "")
-            if not _is_non_answer(answer_before):
-                print(f"[repair] Event {event_id} | AUTO-RESOLVE: score={score_before:.3f} "
-                      f"is already good and answer is substantive. Resolving without rechunk.")
-                report = RepairReport(
-                    event_id=event_id,
-                    strategy_used="auto_resolve",
-                    chunks_before=0,
-                    chunks_after=0,
-                    score_before=round(score_before, 4),
-                    score_after=round(score_before, 4),
-                    resolved=True,
-                    original_answer=log.llm_response,
-                    resolved_answer=answer_before,
-                    dynamic_k=dynamic_k,
-                    chunks_before_text=json.dumps(chunks_before_text),
-                    chunks_after_text=json.dumps(chunks_before_text),
-                    duration_ms=int((time.time() - t0) * 1000),
-                )
-                session.add(report)
-                adaptation = AdaptationLog(
-                    event_id=event_id,
-                    observation=json.dumps({"auto_resolve": True, "score": score_before}),
-                    diagnosis=json.dumps(diagnosis),
-                    strategy_selected="auto_resolve",
-                    config_before=json.dumps({}),
-                    config_after=json.dumps({}),
-                    metrics_before=json.dumps({"top1_score": round(score_before, 4)}),
-                    metrics_after=json.dumps({"top1_score": round(score_before, 4)}),
-                    outcome="IMPROVED",
-                    rolled_back=False,
-                )
-                session.add(adaptation)
-                session.commit()
-                return {
-                    "outcome": "IMPROVED", "improved": True,
-                    "score_before": round(score_before, 4),
-                    "score_after": round(score_before, 4),
-                    "strategy": "auto_resolve",
-                }
-
         # Get the SPECIFIC chunk IDs and text for the failing query
         chunk_ids, full_text, source = _get_chunk_ids_for_query(
-            log.query, k=dynamic_k
+            log.query, k=k_used
         )
 
         if not full_text.strip():
@@ -491,25 +462,11 @@ def handle_event(
             return {"error": "No chunks found for this query — ingest documents first"}
 
         # Extract dynamic chunk config (with backward-compatible defaults)
-        chunk_size = config.get("chunk_size", 250)
-        chunk_overlap = config.get("chunk_overlap", 80)
+        chunk_size = config.get("chunk_size", 1250)
+        chunk_overlap = config.get("chunk_overlap", 200)
 
         print(f"[repair] Found {len(chunk_ids)} chunks to replace for event {event_id} "
               f"(size={chunk_size}, overlap={chunk_overlap})")
-
-        # Save current config state for provenance
-        from detector.decision_engine import get_active_config
-        active_cfg = get_active_config()
-        config_before = {
-            "chunk_size": active_cfg.get("chunk_size", 250),
-            "chunk_overlap": active_cfg.get("chunk_overlap", 80),
-            "strategy": active_cfg.get("chunk_strategy", strategy),
-        }
-        config_after = {
-            "chunk_size": chunk_size,
-            "chunk_overlap": chunk_overlap,
-            "strategy": strategy,
-        }
 
         # Rechunk the text with the chosen strategy + dynamic config
         rechunk_fn = STRATEGY_MAP.get(strategy, rechunk_semantic)
@@ -522,15 +479,15 @@ def handle_event(
                          old_chunk_ids=chunk_ids,
                          event_id=event_id)
 
-        # ── PROBE AFTER: Measure metrics post-repair with same dynamic K ──
-        metrics_after = _probe_metrics(log.query, ground_truths, k=dynamic_k)
+        # ── PROBE AFTER: Measure raw post-rechunk metrics at same K ──
+        metrics_after = _probe_metrics(log.query, ground_truths, k=k_used)
         score_after = metrics_after["top1_score"]
         chunks_after_text = metrics_after.get("chunks", [])
 
-        # ── DECISION: Improved or rollback? ──
+        # ── DECISION + ROLLBACK (only if cascade hasn't claimed ownership) ──
         improved = _is_improved(metrics_before, metrics_after)
         rolled_back = False
-        resolved_answer = None
+        new_ids = counts.get("new_chunk_ids", [])
 
         logging.info(
             f"[repair] Event {event_id} | AFTER metrics: "
@@ -541,138 +498,17 @@ def handle_event(
             f"| improved={improved}"
         )
 
-        # ROLLBACK if repair degraded metrics
-        if not improved:
+        if internal_rollback and not improved:
             print(f"[repair] Rechunk did NOT improve metrics "
                   f"(score {score_before:.3f} -> {score_after:.3f}). Rolling back...")
-            new_ids = counts.get("new_chunk_ids", [])
-            rollback_result = rollback_from_snapshot(event_id, new_chunk_ids=new_ids)
+            rollback_from_snapshot(event_id, new_chunk_ids=new_ids)
             rolled_back = True
-            # Re-probe after rollback to get accurate final score
-            metrics_final = _probe_metrics(log.query, ground_truths, k=dynamic_k)
+            metrics_final = _probe_metrics(log.query, ground_truths, k=k_used)
             score_after = metrics_final["top1_score"]
             print(f"[repair] Rollback complete. Score after rollback: {score_after:.3f}")
 
-            # ══════════════════════════════════════════════════════
-            #  FALLBACK: Query Reformulation
-            # ══════════════════════════════════════════════════════
-            # Rechunking same content didn't help. Try reformulating
-            # the query to find DIFFERENT chunks across the entire index.
-            try:
-                from services.llm_factory import get_llm
-                llm = get_llm()
-                reformulate_prompt = (
-                    "You are a search query optimizer. Rephrase the following question "
-                    "to maximize vector search retrieval. Use different keywords, "
-                    "synonyms, and alternative phrasings while keeping the same meaning. "
-                    "Return ONLY the rephrased question, nothing else.\n\n"
-                    f"Original question: {log.query}"
-                )
-                reformulated = llm.invoke(reformulate_prompt).content.strip()
-                # Strip quotes if LLM wraps it
-                reformulated = reformulated.strip('"').strip("'")
+        resolved_answer = metrics_after.get("answer") if improved else None
 
-                if reformulated and reformulated.lower() != log.query.lower():
-                    print(f"[repair] Trying reformulated query: {reformulated[:80]}...")
-
-                    # Step 1: Use reformulated query to FIND better chunks
-                    metrics_reform = _probe_metrics(
-                        reformulated, ground_truths, k=dynamic_k
-                    )
-
-                    if metrics_reform["top1_score"] > score_before + 0.001:
-                        # Step 2: Generate the REAL answer using the ORIGINAL
-                        # query with the better chunks found via reformulation.
-                        # This is the key fix — we use the reformulated query
-                        # only for retrieval, never for answer generation.
-                        try:
-                            reform_chunks = metrics_reform.get("chunks", [])
-                            context_text = "\n\n".join(reform_chunks)
-                            answer_prompt = (
-                                "You are a precise factual assistant. Answer the question using ONLY the context below. "
-                                "Extract the answer directly from the text. Do NOT use any outside knowledge. "
-                                "If the exact answer appears in the context, state it clearly and concisely.\n\n"
-                                f"Context:\n{context_text}\n\n"
-                                f"Question: {log.query}\n\n"
-                                "Answer:"
-                            )
-                            real_answer = llm.invoke(answer_prompt).content.strip()
-                        except Exception:
-                            real_answer = metrics_reform.get("answer", "")
-
-                        if not _is_non_answer(real_answer):
-                            # Reformulated query found better chunks with real answer!
-                            print(f"[repair] REFORMULATION SUCCESS: "
-                                  f"score {score_before:.3f} -> {metrics_reform['top1_score']:.3f} "
-                                  f"with substantive answer")
-                            improved = True
-                            rolled_back = False
-                            score_after = metrics_reform["top1_score"]
-                            chunks_after_text = metrics_reform.get("chunks", [])
-                            resolved_answer = real_answer
-                            strategy = "query_reformulation"
-                        else:
-                            print(f"[repair] Reformulation found better chunks but answer "
-                                  f"is still a non-answer")
-                    else:
-                        print(f"[repair] Reformulation did not help "
-                              f"(score={metrics_reform['top1_score']:.3f})")
-            except Exception as e:
-                logging.warning(f"[repair] Query reformulation failed: {e}")
-
-            # ══════════════════════════════════════════════════════
-            #  FALLBACK 2: LLM Switch — try gemma3:27b
-            # ══════════════════════════════════════════════════════
-            # Rechunking and reformulation didn't help. The chunks
-            # might actually contain the answer, but mistral (7B)
-            # couldn't extract it. Try gemma3:27b (27B) — a larger
-            # model with better reasoning on the SAME chunks.
-            if not improved:
-                try:
-                    from services.llm_factory import get_fallback_llm
-                    fallback_llm = get_fallback_llm()
-
-                    # Use the original retrieved chunks (no modification)
-                    current_chunks = chunks_before_text
-                    if not current_chunks:
-                        current_chunks = metrics_before.get("chunks", [])
-
-                    if current_chunks:
-                        context_text = "\n\n".join(current_chunks)
-                        fallback_prompt = (
-                            "You are a precise factual assistant. Answer the question using ONLY the context below. "
-                            "Extract the answer directly from the text. Do NOT use any outside knowledge. "
-                            "If the exact answer appears in the context, state it clearly and concisely.\n\n"
-                            f"Context:\n{context_text}\n\n"
-                            f"Question: {log.query}\n\n"
-                            "Answer:"
-                        )
-
-                        print(f"[repair] Trying LLM fallback (gemma3:27b) on same chunks...")
-                        fallback_answer = fallback_llm.invoke(fallback_prompt).content.strip()
-
-                        if not _is_non_answer(fallback_answer):
-                            print(f"[repair] LLM FALLBACK SUCCESS: gemma3:27b extracted "
-                                  f"a substantive answer from the same chunks!")
-                            improved = True
-                            rolled_back = False
-                            # Score stays the same — chunks unchanged
-                            resolved_answer = fallback_answer
-                            strategy = "llm_fallback"
-                            chunks_after_text = current_chunks
-                        else:
-                            print(f"[repair] LLM fallback: gemma3:27b also couldn't "
-                                  f"extract an answer from these chunks.")
-                    else:
-                        print(f"[repair] LLM fallback skipped: no chunks available.")
-                except Exception as e:
-                    logging.warning(f"[repair] LLM fallback failed: {e}")
-
-        else:
-            # Success — keep the repaired answer
-            resolved_answer = metrics_after.get("answer")
-
-        # Determine outcome for provenance
         if improved:
             outcome = "IMPROVED"
         elif rolled_back:
@@ -680,87 +516,10 @@ def handle_event(
         else:
             outcome = "NO_CHANGE"
 
-        # Persist repair report with enhanced metrics
-        report = RepairReport(
-            event_id      = event_id,
-            strategy_used = strategy,
-            chunks_before = counts["old_count"],
-            chunks_after  = counts["new_count"],
-            score_before  = round(score_before, 4),
-            score_after   = round(score_after, 4),
-            resolved      = improved,
-            original_answer = log.llm_response,
-            resolved_answer = resolved_answer,
-            # Enhanced metrics
-            precision_before = metrics_before.get("context_precision"),
-            precision_after  = metrics_after.get("context_precision"),
-            recall_before    = metrics_before.get("recall"),
-            recall_after     = metrics_after.get("recall"),
-            accuracy_before  = metrics_before.get("answer_accuracy"),
-            accuracy_after   = metrics_after.get("answer_accuracy"),
-            duration_ms   = int((time.time() - t0) * 1000),
-            # Dynamic K + chunk texts
-            dynamic_k         = dynamic_k,
-            chunks_before_text = json.dumps(chunks_before_text),
-            chunks_after_text  = json.dumps(chunks_after_text),
-        )
-        # NOTE: Do NOT set event.resolved here — the caller (main.py / auto_worker)
-        # manages the event lifecycle in its own session to prevent stale-data conflicts.
-        session.add(report)
-
-        # Build full metrics dicts for provenance logging
-        metrics_before_log = {"top1_score": round(score_before, 4)}
-        metrics_after_log = {"top1_score": round(score_after, 4)}
-        if has_gt:
-            metrics_before_log.update({
-                "context_precision": metrics_before.get("context_precision"),
-                "recall": metrics_before.get("recall"),
-                "answer_accuracy": metrics_before.get("answer_accuracy"),
-            })
-            metrics_after_log.update({
-                "context_precision": metrics_after.get("context_precision"),
-                "recall": metrics_after.get("recall"),
-                "answer_accuracy": metrics_after.get("answer_accuracy"),
-            })
-
-        # PROVENANCE: Write AdaptationLog with full audit trail
-        adaptation = AdaptationLog(
-            event_id=event_id,
-            observation=json.dumps({
-                "triggered_detectors": json.loads(event.triggered_detectors or "[]"),
-                "score_before": round(score_before, 4),
-                "retrieval_precision": log.retrieval_precision,
-                "context_sufficiency": log.context_sufficiency,
-                "hallucination_rate": log.hallucination_rate,
-                "question_category": log.question_category,
-            }),
-            diagnosis=json.dumps({
-                "root_cause": diagnosis.get("root_cause", "unknown"),
-                "question_category": diagnosis.get("question_category", "unknown"),
-                "severity_score": diagnosis.get("severity_score", 0),
-                "reasoning": diagnosis.get("reasoning", ""),
-            }),
-            strategy_selected=strategy,
-            config_before=json.dumps(config_before),
-            config_after=json.dumps(config_after),
-            metrics_before=json.dumps(metrics_before_log),
-            metrics_after=json.dumps(metrics_after_log),
-            outcome=outcome,
-            rolled_back=rolled_back,
-        )
-        session.add(adaptation)
-        session.commit()
-
         status = "RESOLVED" if improved else ("ROLLED_BACK" if rolled_back else "UNRESOLVED")
         print(f"[repair] event={event_id} strategy={strategy} "
-              f"size={chunk_size} overlap={chunk_overlap} "
+              f"size={chunk_size} overlap={chunk_overlap} K={k_used} "
               f"score {score_before:.3f} -> {score_after:.3f} "
-              f"prec={metrics_before.get('context_precision', 'N/A')}->"
-              f"{metrics_after.get('context_precision', 'N/A')} "
-              f"recall={metrics_before.get('recall', 'N/A')}->"
-              f"{metrics_after.get('recall', 'N/A')} "
-              f"acc={metrics_before.get('answer_accuracy', 'N/A')}->"
-              f"{metrics_after.get('answer_accuracy', 'N/A')} "
               f"{status}")
 
         return {
@@ -768,15 +527,10 @@ def handle_event(
             "strategy"     : strategy,
             "chunk_size"   : chunk_size,
             "chunk_overlap": chunk_overlap,
-            "dynamic_k"    : dynamic_k,
+            "dynamic_k"    : k_used,
+            "k_used"       : k_used,
             "score_before" : round(score_before, 4),
             "score_after"  : round(score_after, 4),
-            "precision_before": metrics_before.get("context_precision"),
-            "precision_after": metrics_after.get("context_precision"),
-            "recall_before": metrics_before.get("recall"),
-            "recall_after": metrics_after.get("recall"),
-            "accuracy_before": metrics_before.get("answer_accuracy"),
-            "accuracy_after": metrics_after.get("answer_accuracy"),
             "improved"     : improved,
             "rolled_back"  : rolled_back,
             "outcome"      : outcome,
@@ -784,7 +538,11 @@ def handle_event(
             "chunks_after" : counts["new_count"],
             "chunks_before_text": chunks_before_text,
             "chunks_after_text" : chunks_after_text,
-            "duration_ms"  : report.duration_ms,
+            "metrics_before": metrics_before,
+            "metrics_after" : metrics_after,
+            "resolved_answer": resolved_answer,
+            "new_chunk_ids": new_ids,
+            "pinecone_touched": True,
         }
 
     except Exception as e:
@@ -792,3 +550,4 @@ def handle_event(
         return {"error": str(e)}
     finally:
         session.close()
+
