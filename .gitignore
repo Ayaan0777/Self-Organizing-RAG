@@ -36,3 +36,8 @@ Desktop.ini
 # Distribution
 *.tar.gz
 *.whl
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
