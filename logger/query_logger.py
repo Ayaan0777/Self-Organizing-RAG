@@ -48,24 +48,21 @@ def log_query(
     finally:
         session.close()
 
-def update_log_eval_metrics(log_id: int, answer_sem_sim: float, ctx_q_sim: float, retrieved_contexts: list = None):
+def update_log_eval_metrics(log_id: int, answer_sem_sim: float, ctx_q_sim: float):
+    """
+    Writes answer-similarity + context-question similarity onto a QueryLog row.
+    The retrieved chunk texts are already persisted by log_query() into the
+    retrieved_chunks column — there was a defunct retrieved_contexts kwarg here
+    that wrote to a non-existent column and got silently dropped. Removed.
+    """
     session = get_session()
     try:
         log_entry = session.query(QueryLog).filter(QueryLog.id == log_id).first()
         if log_entry:
             log_entry.answer_sem_sim = answer_sem_sim
             log_entry.ctx_q_sim = ctx_q_sim
-            
-            # ✅ Convert list of contexts/documents to a clean text string for SQLite
-            if retrieved_contexts is not None:
-                clean_contexts = [
-                    ctx.page_content if hasattr(ctx, 'page_content') else str(ctx)
-                    for ctx in retrieved_contexts
-                ]
-                log_entry.retrieved_contexts = json.dumps(clean_contexts, ensure_ascii=False)
-                
             session.commit()
-            print(f"      [db] updated evaluation metrics and contexts for log_id {log_id}")
+            print(f"      [db] updated evaluation metrics for log_id {log_id}")
     except Exception as e:
         session.rollback()
         print(f"      [db] failed to update metrics: {e}")

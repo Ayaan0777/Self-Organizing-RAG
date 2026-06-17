@@ -108,7 +108,8 @@ def run_batch_worker():
                 print(f"   Returning to monitoring mode.\n")
 
             else:
-                # Still accumulating — show heartbeat
+                # Still accumulating — show heartbeat. Uses a normal newline
+                # (not \r) so it doesn't collide with cascade print() output.
                 if pending_count > 0:
                     if total_queries > 0:
                         ratio_pct = round(pending_count / total_queries * 100, 1)
@@ -121,8 +122,7 @@ def run_batch_worker():
                         reasons.append(f"ratio={ratio_pct}%/{int(PENDING_RATIO*100)}%")
                     print(
                         f"⏳ Waiting: {pending_count} pending events, "
-                        f"but threshold not met ({', '.join(reasons)})",
-                        end="\r"
+                        f"but threshold not met ({', '.join(reasons)})"
                     )
 
         except Exception as db_err:

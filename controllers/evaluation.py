@@ -138,10 +138,9 @@ async def process_local_evaluation(file: UploadFile, namespace: str, max_questio
 
             try:
                 update_log_eval_metrics(
-                    log_id = log_id,
-                    answer_sem_sim = ss,
-                    ctx_q_sim = ctx_sims["ctx_question_sim"],
-                    retrieved_contexts = retrieved_contexts
+                    log_id=log_id,
+                    answer_sem_sim=ss,
+                    ctx_q_sim=ctx_sims["ctx_question_sim"],
                 )
                 # Persist the new Stage 2 metrics
                 update_log_new_metrics(

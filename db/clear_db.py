@@ -73,6 +73,8 @@ def clear_sqlite_tables():
         "autorag_pipeline_config",
         "autorag_chunk_snapshots",
         "autorag_adaptation_log",
+        "autorag_strategy_counters",
+        "autorag_runtime_flags",
     ]
 
     try:

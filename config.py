@@ -23,7 +23,10 @@ class Settings(BaseSettings):
     precision_threshold: float = 0.5       # retrieval precision below this triggers repair
     sufficiency_threshold: float = 0.7     # context sufficiency check threshold
     hallucination_threshold: float = 0.2   # hallucination rate above this triggers repair
-    cooldown_seconds: int = 120            # seconds to wait between repair attempts (per event)
+
+    # Ground-truth dataset for the gt_lookup module. Path is relative to the
+    # project root. Edit here (or in .env) to switch datasets without code changes.
+    gt_dataset_path: str = "dataset/long_ans.json"
 
     class Config:
         env_file = ".env"

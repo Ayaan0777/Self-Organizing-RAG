@@ -345,19 +345,21 @@ def _get_ground_truths_for_query(query_log) -> list:
     """
     Returns ground-truth answers for a query, or [] if none are available.
 
-    Previously this returned [query_log.llm_response] when answer_sem_sim
-    was populated, treating the previous LLM answer as a "ground truth".
-    That was wrong: the LLM answer for a flagged query is the BAD answer
-    we're trying to repair. Comparing repair results against it produced
-    meaningless precision/recall numbers.
+    Looks up the dataset (controllers/gt_lookup.py loads dataset/long_ans.json
+    on first call) by normalized question text. When a match is found, the
+    cascade's _probe_metrics gets real precision/recall/accuracy signals
+    against the reference answers instead of falling back to the top1-only
+    no-GT path. This makes _is_improved much sharper on dataset-matched
+    queries.
 
-    Real ground truths only exist when an evaluation run supplied them.
-    Until they're persisted per-query (currently the eval pipeline doesn't
-    write them into the DB), return [] and let the probe take the no-GT
-    path. That keeps win-decisions honest — based on retrieval score and
-    non-answer detection, not on phantom ground truths.
+    Falls back to [] silently on any failure — no GT path still works fine.
     """
-    return []
+    try:
+        from controllers.gt_lookup import lookup_ground_truth
+        gts = lookup_ground_truth(query_log.query)
+        return gts if gts else []
+    except Exception:
+        return []
 
 
 # ══════════════════════════════════════════════════════════════

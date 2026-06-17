@@ -46,29 +46,16 @@ class AddChunksReq(BaseModel):
 @router.post("/add-chunks")
 async def add_chunks_endpoint(req: AddChunksReq):
     """Chunks raw text using the same recursive splitter as ingestion
-    (variable size 500–1250 chars). Optionally ingests to Pinecone."""
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-    from controllers.ingestion import (
-        CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHUNK_SIZE,
-        SEPARATORS, _enforce_min_chunk_size,
-    )
+    (variable size 500–1250 chars). Optionally ingests to Pinecone.
 
-    # Exact same parameters as ingestion pipeline
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=SEPARATORS,
-        length_function=len,
-    )
-    chunks = splitter.create_documents(
-        [req.text],
-        metadatas=[{"source": req.source, "strategy": "recursive"}],
-    )
+    Delegates to add_chunks.add_chunk so the splitting rule lives in
+    exactly one place.
+    """
+    from add_chunks import add_chunk
 
-    # Enforce minimum chunk size — same as ingestion
-    chunks = _enforce_min_chunk_size(chunks, min_chars=MIN_CHUNK_SIZE)
-
+    chunks = add_chunk(req.text, req.source)
     sizes = [len(c.page_content) for c in chunks]
+
     result = {
         "strategy": "recursive",
         "num_chunks": len(chunks),
@@ -79,7 +66,7 @@ async def add_chunks_endpoint(req: AddChunksReq):
         ],
     }
 
-    if req.ingest:
+    if req.ingest and chunks:
         from services.llm_factory import get_vector_store
         vs = get_vector_store(req.namespace)
         vs.add_documents(chunks)

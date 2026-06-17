@@ -90,3 +90,8 @@ def check_retrieval_needed(query: str) -> dict:
             "reason": "fallback",
             "gate_detail": f"Gate classification failed — defaulting to retrieval. Error: {e}",
         }
+
+
+# Note: the higher-level fallback dict built in controllers/retrieval.py
+# (when the gate import itself fails) also needs to include "gate_detail"
+# for consistency. That's handled at the call site.

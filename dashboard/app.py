@@ -588,7 +588,15 @@ def chunk_card(i, chunk, score):
 # ══════════════════════════════════════════════════════════════════════════
 #  TITLE & NAV
 # ══════════════════════════════════════════════════════════════════════════
-session = get_session()
+@st.cache_resource
+def _dashboard_session():
+    """One SQLAlchemy session for the Streamlit process — Streamlit re-runs
+    the whole script on every interaction, so without caching we'd leak one
+    new session per click."""
+    return get_session()
+
+
+session = _dashboard_session()
 
 page = st.sidebar.radio(
     "NAVIGATE",
@@ -697,12 +705,12 @@ if page == "Overview":
         </tr>
         <tr>
             <td><code>semantic_mismatch</code></td>
-            <td>Chunks are semantically fragmented</td>
-            <td class="thresh">0.70</td>
+            <td>Mean pairwise chunk sim below ratio × top1 (K-adaptive)</td>
+            <td class="thresh">0.65 × top1</td>
         </tr>
         <tr>
             <td><code>evidence_mismatch</code></td>
-            <td>LLM answer diverges from retrieved context</td>
+            <td>Best chunk↔answer similarity below floor</td>
             <td class="thresh">0.60</td>
         </tr>
     </table>
@@ -997,13 +1005,13 @@ elif page == "Query Diagnostics":
 
             if has_gt:
                 col1, col2, col3, col4 = st.columns(4)
-                col1.metric("CTX↔QUERY SIM",  f"{cqs:.4f}" if cqs else "N/A")
+                col1.metric("CTX↔QUERY SIM",  f"{cqs:.4f}" if cqs is not None else "N/A")
                 col2.metric("ANSWER↔GT SIM",  f"{asim:.4f}")
                 col3.metric("LATENCY",          f"{selected.latency_ms / 1000:.2f}s")
                 col4.metric("STATUS",           "⚠ FLAGGED" if selected.flagged else "✓ OK")
             else:
                 col1, col2, col3 = st.columns(3)
-                col1.metric("CTX↔QUERY SIM",  f"{cqs:.4f}" if cqs else "N/A")
+                col1.metric("CTX↔QUERY SIM",  f"{cqs:.4f}" if cqs is not None else "N/A")
                 col2.metric("LATENCY",          f"{selected.latency_ms / 1000:.2f}s")
                 col3.metric("STATUS",           "⚠ FLAGGED" if selected.flagged else "✓ OK")
                 st.caption("NO GROUND TRUTH — answer similarity not computed")

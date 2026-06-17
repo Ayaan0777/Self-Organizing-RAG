@@ -54,7 +54,12 @@ def add_chunk(
     # Enforce minimum chunk size — merge tiny chunks with neighbors
     chunks = _enforce_min_chunk_size(chunks, min_chars=MIN_CHUNK_SIZE)
 
-    # Stats
+    # Stats — guard against the empty case (very short input that gets eaten
+    # by the splitter's separators after merging).
+    if not chunks:
+        print(f"[add-chunks] recursive | 0 chunks (input too short to split)")
+        return chunks
+
     sizes = [len(c.page_content) for c in chunks]
     print(
         f"[add-chunks] recursive | "

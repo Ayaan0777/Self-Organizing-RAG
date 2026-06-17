@@ -18,15 +18,24 @@ import json
 import logging
 import os
 import re
+import threading
 from typing import Optional
 
-_DATASET_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..", "dataset", "long_ans.json",
+from config import settings
+
+# Resolved to an absolute, normalized path so error messages stay readable
+# and `..` segments don't leak through.
+_DATASET_PATH = os.path.normpath(
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        settings.gt_dataset_path,
+    )
 )
 
 _gt_index: dict = {}   # normalized question → list[str] ground truths
 _loaded: bool = False
+_load_lock = threading.Lock()
 
 
 def _normalize(text: str) -> str:
@@ -38,28 +47,42 @@ def _normalize(text: str) -> str:
 
 
 def _load_dataset():
-    """Loads long_ans.json into the in-memory index. Idempotent."""
+    """Loads the GT dataset into the in-memory index. Idempotent + thread-safe.
+
+    Duplicate questions (SQuAD-style datasets repeat the same `qun` across
+    `para` IDs) are merged into a deduplicated list of answers instead of
+    overwriting earlier entries.
+    """
     global _gt_index, _loaded
     if _loaded:
         return
-    try:
-        if not os.path.exists(_DATASET_PATH):
-            logging.warning(f"[gt_lookup] dataset not found at {_DATASET_PATH}")
-            _loaded = True
+    with _load_lock:
+        # Re-check after acquiring the lock (another thread may have loaded).
+        if _loaded:
             return
-        with open(_DATASET_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for item in data:
-            q = item.get("qun", "")
-            a = item.get("ans", [])
-            if q and a:
-                _gt_index[_normalize(q)] = a if isinstance(a, list) else [a]
-        logging.info(f"[gt_lookup] loaded {len(_gt_index)} known questions from long_ans.json")
-        print(f"[gt_lookup] loaded {len(_gt_index)} known questions from long_ans.json")
-    except Exception as e:
-        logging.warning(f"[gt_lookup] failed to load dataset: {e}")
-    finally:
-        _loaded = True
+        try:
+            if not os.path.exists(_DATASET_PATH):
+                logging.warning(f"[gt_lookup] dataset not found at {_DATASET_PATH}")
+                return
+            with open(_DATASET_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for item in data:
+                q = item.get("qun", "")
+                a = item.get("ans", [])
+                if not (q and a):
+                    continue
+                key = _normalize(q)
+                answers = a if isinstance(a, list) else [a]
+                existing = _gt_index.get(key, [])
+                # Merge + dedupe while preserving insertion order.
+                _gt_index[key] = list(dict.fromkeys(existing + answers))
+            msg = f"[gt_lookup] loaded {len(_gt_index)} unique questions from {os.path.basename(_DATASET_PATH)}"
+            logging.info(msg)
+            print(msg)
+        except Exception as e:
+            logging.warning(f"[gt_lookup] failed to load dataset: {e}")
+        finally:
+            _loaded = True
 
 
 def lookup_ground_truth(query: str) -> Optional[list]:
@@ -130,7 +153,6 @@ def enrich_log_with_gt(
         log_id=log_id,
         answer_sem_sim=ss,
         ctx_q_sim=ctx_sims["ctx_question_sim"],
-        retrieved_contexts=contexts,
     )
     update_log_new_metrics(
         log_id=log_id,

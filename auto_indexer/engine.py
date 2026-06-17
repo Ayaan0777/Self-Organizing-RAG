@@ -409,24 +409,10 @@ class AutoIndexer:
         print(f"\n[auto-indexer] Full refresh complete in {duration_ms}ms")
         print("=" * 60)
 
-        # Persist to DB
-        try:
-            from db.session import get_session
-            from db.models import EvalSnapshot
-            s = get_session()
-            snap = EvalSnapshot(
-                namespace=self.namespace,
-                llm="auto-indexer",
-                embeddings=settings.embedding_model_name,
-                rouge_l=0.0,
-                sem_sim=0.0,
-                ctx_q_sim=staleness["avg_drift"],
-                ctx_gt_sim=float(staleness["stale_count"]),
-            )
-            s.add(snap)
-            s.commit()
-            s.close()
-        except Exception:
-            pass
+        # NOTE: previously this block persisted index-refresh telemetry into
+        # the EvalSnapshot table by jamming `avg_drift` into `ctx_q_sim` and
+        # `stale_count` into `ctx_gt_sim`. That polluted the dashboard's
+        # eval-history feed with rows that aren't evaluations. Removed.
+        # If index-health snapshots are wanted later, add a dedicated table.
 
         return report

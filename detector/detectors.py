@@ -86,7 +86,9 @@ def _detect_semantic_mismatch(chunks: list[str], top1_score: float) -> bool:
         return False
     try:
         emb_model = _get_embeddings_model()
-        embeddings = [np.array(emb_model.embed_query(c[:500])) for c in chunks]
+        # Single batched embed call — one Ollama roundtrip instead of N.
+        raw = emb_model.embed_documents([c[:500] for c in chunks])
+        embeddings = [np.array(e) for e in raw]
 
         sims = []
         for i in range(len(embeddings)):
@@ -119,13 +121,15 @@ def _detect_evidence_mismatch(answer: str, chunks: list[str]) -> bool:
         return False
     try:
         emb_model = _get_embeddings_model()
-        answer_emb = np.array(emb_model.embed_query(answer[:500]))
-        max_sim = 0.0
-        for c in chunks:
-            chunk_emb = np.array(emb_model.embed_query(c[:500]))
-            sim = _cosine_sim(answer_emb, chunk_emb)
-            if sim > max_sim:
-                max_sim = sim
+        # Single batched embed call: answer + all chunks in one roundtrip.
+        texts = [answer[:500]] + [c[:500] for c in chunks]
+        raw = emb_model.embed_documents(texts)
+        answer_emb = np.array(raw[0])
+        chunk_embs = [np.array(e) for e in raw[1:]]
+        max_sim = max(
+            (_cosine_sim(answer_emb, ce) for ce in chunk_embs),
+            default=0.0,
+        )
         return max_sim < EVIDENCE_MATCH
     except Exception:
         return False
@@ -138,8 +142,8 @@ def run_detectors(log_id: int):
     Called automatically at the end of answer_query() in controllers/retrieval.py.
     Silent on failure — never raises, never blocks the API response.
     """
-    if log_id < 0:
-        return  # upstream logging failed, nothing to detect on
+    if log_id <= 0:
+        return  # upstream logging failed (sentinel -1) or invalid id
 
     session = get_session()
     try:
