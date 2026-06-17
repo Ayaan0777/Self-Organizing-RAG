@@ -35,25 +35,48 @@ async def eval_endpoint(req: EvalReq):
     return evaluation.calculate_metrics(req.question, req.ground_truth)
 
 
-# ── Auto-Chunker endpoint ─────────────────────────────────────
-class AutoChunkReq(BaseModel):
+# ── Add Chunks endpoint ───────────────────────────────────────
+class AddChunksReq(BaseModel):
     text: str
     source: str = "manual"
-    strategy: str = "semantic"       # "semantic" or "clustering"
     ingest: bool = False             # if True, also upload to Pinecone
     namespace: str = None
 
 
-@router.post("/auto-chunk")
-async def auto_chunk_endpoint(req: AutoChunkReq):
-    """Runs the auto-chunker pipeline. Optionally ingests results to Pinecone."""
-    from auto_chunker import auto_chunk
-    chunks = auto_chunk(req.text, req.source, strategy=req.strategy)
+@router.post("/add-chunks")
+async def add_chunks_endpoint(req: AddChunksReq):
+    """Chunks raw text using the same recursive splitter as ingestion
+    (variable size 500–1250 chars). Optionally ingests to Pinecone."""
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from controllers.ingestion import (
+        CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHUNK_SIZE,
+        SEPARATORS, _enforce_min_chunk_size,
+    )
 
+    # Exact same parameters as ingestion pipeline
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=SEPARATORS,
+        length_function=len,
+    )
+    chunks = splitter.create_documents(
+        [req.text],
+        metadatas=[{"source": req.source, "strategy": "recursive"}],
+    )
+
+    # Enforce minimum chunk size — same as ingestion
+    chunks = _enforce_min_chunk_size(chunks, min_chars=MIN_CHUNK_SIZE)
+
+    sizes = [len(c.page_content) for c in chunks]
     result = {
-        "strategy": req.strategy,
+        "strategy": "recursive",
         "num_chunks": len(chunks),
-        "chunks": [{"content": c.page_content[:200], "chars": len(c.page_content)} for c in chunks],
+        "size_range": f"{min(sizes)}-{max(sizes)}" if sizes else "0",
+        "chunks": [
+            {"content": c.page_content[:300], "chars": len(c.page_content)}
+            for c in chunks
+        ],
     }
 
     if req.ingest:

@@ -592,7 +592,7 @@ session = get_session()
 
 page = st.sidebar.radio(
     "NAVIGATE",
-    ["Overview", "Ingest Document", "Ask Query", "Query Diagnostics",
+    ["Overview", "Ingest Document", "Ask Query", "Add Chunks", "Query Diagnostics",
      "Flagged Events", "Eval History", "Pipeline Config", "Adaptation Log"],
 )
 
@@ -828,6 +828,70 @@ elif page == "Ask Query":
                 st.error("▸ TIMEOUT — LLM response too slow")
             except Exception as e:
                 st.error(f"▸ ERROR — {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ADD CHUNKS
+# ══════════════════════════════════════════════════════════════════════════
+elif page == "Add Chunks":
+    page_header("PIPELINE // INPUT", "ADD NEW CHUNKS")
+    backend_up = backend_status()
+
+    term_div()
+    st.markdown(
+        '<div style="font-family:var(--font-mono);font-size:0.8rem;color:#4a5280;margin-bottom:12px;">'
+        'Paste raw text below to preview how it will be chunked. '
+        'Optionally ingest chunks directly to Pinecone.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    raw_text = st.text_area("RAW TEXT", height=200, placeholder="// paste document text here...")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        source_name = st.text_input("SOURCE NAME", value="manual-paste")
+    with col2:
+        ns_chunk = st.text_input("NAMESPACE", value="", key="chunk_ns")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        chunk_btn = st.button("▸ CHUNK IT", type="primary", disabled=not raw_text.strip())
+    with col_b:
+        ingest_btn = st.button("▸ CHUNK + INGEST", disabled=not raw_text.strip() or not backend_up)
+
+    if chunk_btn or ingest_btn:
+        with st.spinner("Chunking..."):
+            try:
+                payload = {
+                    "text": raw_text.strip(),
+                    "source": source_name,
+                    "ingest": ingest_btn,
+                }
+                if ns_chunk.strip():
+                    payload["namespace"] = ns_chunk.strip()
+
+                resp = requests.post(f"{API_BASE}/add-chunks", json=payload, timeout=120)
+                if resp.status_code == 200:
+                    result = resp.json()
+                    chunks_data = result.get("chunks", [])
+
+                    sec_header(f"RESULT: {result['num_chunks']} CHUNKS ({result.get('size_range', '')})")
+
+                    if ingest_btn and result.get("ingested"):
+                        st.success(f"▸ Ingested to namespace: {result.get('namespace', 'default')}")
+
+                    for i, c in enumerate(chunks_data):
+                        score_cls = "score-high" if c['chars'] >= 500 else ("score-mid" if c['chars'] >= 200 else "score-low")
+                        st.markdown(f"""
+                        <div class="chunk-card {score_cls}">
+                            <div class="chunk-rank">CHUNK_{i+1:02d} &nbsp;·&nbsp; {c['chars']} CHARS</div>
+                            <div class="chunk-text">{c['content'][:400]}{'…' if len(c['content']) > 400 else ''}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                else:
+                    st.error(f"Failed — HTTP {resp.status_code}")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
