@@ -1,17 +1,13 @@
 """
-Low Recall Detector — Month 2 Prototype
+Low Recall Detector
 ========================================
-6 detection rules, each independent and non-blocking:
+5 detection rules, each independent and non-blocking:
 
-  Existing (Month 1):
-    1. low_top_score      — Top-1 retrieval score below threshold
-    2. score_drop         — Large gap between rank-1 and rank-K
-    3. llm_uncertainty    — LLM response contains hedging language
-
-  New (Month 2):
-    4. semantic_mismatch  — Retrieved chunks are semantically fragmented
-    5. evidence_mismatch  — LLM answer doesn't match retrieved evidence
-    6. user_frustration   — User reformulated a similar query recently
+  1. low_top_score      — Top-1 retrieval score below threshold
+  2. score_drop         — Largest adjacent-rank score gap
+  3. llm_uncertainty    — LLM response contains hedging language
+  4. semantic_mismatch  — Retrieved chunks are semantically fragmented
+  5. evidence_mismatch  — LLM answer doesn't match retrieved evidence
 """
 import json
 import numpy as np
@@ -27,8 +23,6 @@ SCORE_LOW          = 0.65   # rule 1: top-1 score below this → flag
 SCORE_DROP         = 0.15   # rule 2: gap rank-1 to rank-K above this → flag
 CHUNK_COHERENCE    = 0.70   # rule 4: mean pairwise chunk sim below this → flag
 EVIDENCE_MATCH     = 0.60   # rule 5: answer↔evidence sim below this → flag
-FRUSTRATION_SIM    = 0.85   # rule 6: cosine sim threshold for "same query"
-FRUSTRATION_WINDOW = 300    # rule 6: seconds to look back for reformulations
 
 UNCERTAINTY_PHRASES = [
     # Direct uncertainty
@@ -110,39 +104,9 @@ def _detect_evidence_mismatch(answer: str, chunks: list[str]) -> bool:
         return False
 
 
-def _detect_user_frustration(query: str, session) -> bool:
-    """
-    Rule 6 — User Frustration Signal Detector
-    Checks if a semantically similar query was asked within the last N seconds.
-    Repeated/reformulated queries indicate the user is unsatisfied with results.
-    """
-    try:
-        cutoff = datetime.utcnow() - timedelta(seconds=FRUSTRATION_WINDOW)
-        recent = session.query(QueryLog).filter(
-            QueryLog.timestamp >= cutoff
-        ).order_by(QueryLog.timestamp.desc()).limit(20).all()
-
-        if len(recent) < 2:
-            return False
-
-        emb_model = _get_embeddings_model()
-        query_emb = np.array(emb_model.embed_query(query[:500]))
-
-        # Compare against recent queries (skip the current one, which is the most recent)
-        for row in recent[1:]:
-            prev_emb = np.array(emb_model.embed_query(row.query[:500]))
-            sim = _cosine_sim(query_emb, prev_emb)
-            if sim >= FRUSTRATION_SIM:
-                return True
-
-        return False
-    except Exception:
-        return False
-
-
 def run_detectors(log_id: int):
     """
-    Runs all 6 detection rules against a freshly logged query.
+    Runs all 5 detection rules against a freshly logged query.
     Writes a LowRecallEvent if any rules trigger. Marks the QueryLog row as flagged.
     Called automatically at the end of answer_query() in controllers/retrieval.py.
     Silent on failure — never raises, never blocks the API response.
@@ -186,9 +150,7 @@ def run_detectors(log_id: int):
         if chunks and _detect_evidence_mismatch(log.llm_response or "", chunks):
             triggered.append("evidence_mismatch")
 
-        # Rule 6 — User seems to be re-asking the same thing (frustration)
-        if _detect_user_frustration(log.query, session):
-            triggered.append("user_frustration")
+
 
         if not triggered:
             return  # healthy query, nothing to do

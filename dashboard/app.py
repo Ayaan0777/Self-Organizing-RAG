@@ -705,11 +705,6 @@ if page == "Overview":
             <td>LLM answer diverges from retrieved context</td>
             <td class="thresh">0.60</td>
         </tr>
-        <tr>
-            <td><code>user_frustration</code></td>
-            <td>Similar query re-asked within 5 min</td>
-            <td class="thresh">0.85</td>
-        </tr>
     </table>
     """, unsafe_allow_html=True)
 
@@ -1006,7 +1001,6 @@ elif page == "Query Diagnostics":
                         "llm_uncertainty":  "LLM_UNCERTAINTY — response contains hedging language",
                         "semantic_mismatch":"SEMANTIC_MISMATCH — retrieved chunks cover different topics",
                         "evidence_mismatch":"EVIDENCE_MISMATCH — LLM answer diverges from retrieved context",
-                        "user_frustration": "USER_FRUSTRATION — similar query re-asked within 5 minutes",
                     }
                     for d in detectors:
                         st.markdown(

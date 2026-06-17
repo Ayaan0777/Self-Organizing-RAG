@@ -100,7 +100,7 @@ This guarantees every chunk is ≥ 500 chars, ensuring meaningful embeddings.
 
 **File:** `detector/detectors.py`
 
-Six independent detection rules run after every query. If any trigger, a `LowRecallEvent` is created:
+Five independent detection rules run after every query. If any trigger, a `LowRecallEvent` is created:
 
 | # | Rule | What it Detects | Threshold |
 |---|------|----------------|-----------|
@@ -109,7 +109,6 @@ Six independent detection rules run after every query. If any trigger, a `LowRec
 | 3 | `llm_uncertainty` | LLM response contains hedging language | 50+ phrases |
 | 4 | `semantic_mismatch` | Retrieved chunks are about different topics | pairwise sim < 0.70 |
 | 5 | `evidence_mismatch` | LLM answer doesn't match the evidence | answer↔evidence sim < 0.60 |
-| 6 | `user_frustration` | Same question re-asked within 5 minutes | cosine sim > 0.85 |
 
 > [!NOTE]
 > Thresholds are calibrated for `mxbai-embed-large` which produces scores in the 0.55–0.85 range (higher than typical models).
@@ -506,7 +505,6 @@ erDiagram
 |---|-------|--------|
 | `QueryLog.chunk_ids` | Stores source filenames, not Pinecone IDs | Harmless — repair does fresh lookups |
 | `_resolve_main_k` per-query DB hit | Opens SQLite session per query (~1ms) | Could cache with TTL |
-| `_detect_user_frustration` re-embeds | Embeds last 20 queries on every call | Could cache by `query_log.id` |
 | `answer_query` double Pinecone call | `similarity_search_with_score` + retrieval chain | Could fold scoring into chain |
 | Snapshot rows on success | S2/S3 snapshots persist after resolve | Harmless — forensic audit trail |
 
