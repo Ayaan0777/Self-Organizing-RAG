@@ -1,4 +1,5 @@
 import time
+import logging
 from services.llm_factory import get_vector_store, get_llm
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
@@ -48,13 +49,30 @@ def _resolve_main_k(query: str) -> int:
 
 def answer_query(query: str, namespace: str = None):
     """
-    Full RAG pipeline: retrieve from Pinecone, generate answer, log, detect.
+    Full RAG pipeline with retrieval gating:
+      0. Retrieval gating  — skip Pinecone for greetings/chitchat
+      1. Retrieval         — fetch top-k chunks from Pinecone
+      2. Answer generation — single-pass through the stuff chain
+      3. Logging + detection
     Uses dynamic K if Strategy 1 has been promoted, otherwise K=5.
     """
+    t0 = time.time()
+
+    # ── Step 0: Retrieval Gating ────────────────────────────────
+    try:
+        from organiser.retrieval_gate import check_retrieval_needed
+        gate_result = check_retrieval_needed(query)
+    except Exception as e:
+        logging.warning(f"[retrieval] gate import/call failed ({e}), defaulting to retrieve")
+        gate_result = {"needs_retrieval": True, "reason": "fallback"}
+
+    if not gate_result["needs_retrieval"]:
+        return _direct_answer(query, t0, gate_result)
+
+    # ── Step 1: Retrieval ───────────────────────────────────────
     vector_store = get_vector_store(namespace)
     k = _resolve_main_k(query)
 
-    t0 = time.time()
     docs_with_scores = vector_store.similarity_search_with_score(query, k=k)
     docs   = [d for d, _ in docs_with_scores]
     # Pinecone returns cosine similarity directly (1 = identical, 0 = unrelated)
@@ -126,3 +144,49 @@ def generate_answer_only(query: str, namespace: str = None, k: int = None):
         "scores"            : scores,
     }
 
+
+def _direct_answer(query: str, t0: float, gate_result: dict) -> dict:
+    """
+    Handles queries that don't need retrieval (greetings, chitchat, etc.).
+    Answers directly from the LLM without touching Pinecone.
+    """
+    from langchain_core.messages import SystemMessage, HumanMessage
+
+    llm = get_llm()
+    direct_response = llm.invoke([
+        SystemMessage(content=(
+            "You are a document Q&A assistant for a RAG (Retrieval-Augmented Generation) system. "
+            "Your ONLY purpose is to help users ask questions about their ingested documents. "
+            "When users greet you or send casual messages, respond warmly but ALWAYS guide them "
+            "toward asking about their documents. "
+            "For example, if they say 'hi', respond like: "
+            "'Hello! What would you like to know about your documents?' "
+            "or 'Hi there! Feel free to ask any question about the documents you have ingested.' "
+            "NEVER suggest activities outside document Q&A (no music, alarms, browsing, etc). "
+            "NEVER ask generic questions like 'what is on your mind?' or 'how can I help you today?'. "
+            "ALWAYS mention documents, RAG, or ingested data in your response to keep context clear. "
+            "Keep responses concise — one or two sentences max."
+        )),
+        HumanMessage(content=query),
+    ]).content
+    latency_ms = int((time.time() - t0) * 1000)
+
+    # Still log for tracking — but with empty scores/chunks
+    log_id = log_query(
+        query           = query,
+        scores          = [],
+        answer          = direct_response,
+        latency_ms      = latency_ms,
+        chunk_metadatas = [],
+        chunk_contents  = [],
+    )
+    # Skip run_detectors — retrieval-based detection is irrelevant for direct answers
+
+    return {
+        "answer"            : direct_response,
+        "retrieved_contexts": [],
+        "scores"            : [],
+        "log_id"            : log_id,
+        "gate"              : "direct",
+        "gate_detail"       : gate_result.get("gate_detail", ""),
+    }
