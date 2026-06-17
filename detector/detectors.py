@@ -21,7 +21,13 @@ from db.models import QueryLog, LowRecallEvent
 # so thresholds must be higher than typical 0.3–0.6 range models.
 SCORE_LOW          = 0.65   # rule 1: top-1 score below this → flag
 SCORE_DROP         = 0.15   # rule 2: gap rank-1 to rank-K above this → flag
-CHUNK_COHERENCE    = 0.70   # rule 4: mean pairwise chunk sim below this → flag
+CHUNK_COHERENCE    = 0.55   # rule 4: mean pairwise chunk sim below this → flag
+                            # Lowered from 0.70 — cross-section retrieval within one
+                            # document (e.g. stadium / game / players paragraphs of
+                            # the same Wikipedia article) sits around 0.55–0.65 and
+                            # was tripping the rule on legitimate spread. 0.55 still
+                            # catches truly off-topic retrieval (different domains
+                            # cluster near 0.20–0.40).
 EVIDENCE_MATCH     = 0.60   # rule 5: answer↔evidence sim below this → flag
 
 UNCERTAINTY_PHRASES = [
