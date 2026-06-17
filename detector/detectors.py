@@ -21,13 +21,14 @@ from db.models import QueryLog, LowRecallEvent
 # so thresholds must be higher than typical 0.3–0.6 range models.
 SCORE_LOW          = 0.65   # rule 1: top-1 score below this → flag
 SCORE_DROP         = 0.15   # rule 2: gap rank-1 to rank-K above this → flag
-CHUNK_COHERENCE    = 0.55   # rule 4: mean pairwise chunk sim below this → flag
-                            # Lowered from 0.70 — cross-section retrieval within one
-                            # document (e.g. stadium / game / players paragraphs of
-                            # the same Wikipedia article) sits around 0.55–0.65 and
-                            # was tripping the rule on legitimate spread. 0.55 still
-                            # catches truly off-topic retrieval (different domains
-                            # cluster near 0.20–0.40).
+COHERENCE_RATIO    = 0.65   # rule 4: mean_pairwise_sim / top1_score must be ≥ this,
+                            # else flag. Relative threshold — adapts to retrieval
+                            # quality so healthy cross-section queries (where top1
+                            # is modest and chunks naturally spread) don't false-fire.
+                            # Edit here to tune:
+                            #   0.50 = very lenient (only severe fragmentation)
+                            #   0.65 = balanced (recommended starting point)
+                            #   0.80 = strict (may catch healthy cross-section)
 EVIDENCE_MATCH     = 0.60   # rule 5: answer↔evidence sim below this → flag
 
 UNCERTAINTY_PHRASES = [
@@ -65,14 +66,23 @@ def _get_embeddings_model():
     return get_embeddings()
 
 
-def _detect_semantic_mismatch(chunks: list[str]) -> bool:
+def _detect_semantic_mismatch(chunks: list[str], top1_score: float) -> bool:
     """
-    Rule 4 — Semantic Mismatch Detector
-    Checks whether the top-K retrieved chunks are semantically coherent.
-    If chunks are about wildly different topics (low mean pairwise similarity),
-    retrieval is fragmented and the LLM gets confused context.
+    Rule 4 — Semantic Mismatch Detector (relative threshold)
+    Flags when the lower-ranked chunks are inconsistent with the top match.
+    Computes mean pairwise chunk similarity and compares it against
+    COHERENCE_RATIO × top1_score.
+
+    Why relative instead of absolute: cross-section queries naturally pull
+    chunks from different sub-topics within one document (e.g. stadium /
+    game / players paragraphs of one Wikipedia article). Their mean pairwise
+    sim sits ~0.55–0.65, tripping any absolute threshold above ~0.55. By
+    tying the bar to top1 we expect coherence proportional to retrieval
+    quality: high top1 → expect tight chunks; modest top1 → tolerate spread.
+
+    Skips when top1 ≤ 0 (no retrieval) — Rule 1 owns that case.
     """
-    if len(chunks) < 2:
+    if len(chunks) < 2 or top1_score <= 0:
         return False
     try:
         emb_model = _get_embeddings_model()
@@ -83,8 +93,9 @@ def _detect_semantic_mismatch(chunks: list[str]) -> bool:
             for j in range(i + 1, len(embeddings)):
                 sims.append(_cosine_sim(embeddings[i], embeddings[j]))
 
-        mean_sim = np.mean(sims) if sims else 1.0
-        return float(mean_sim) < CHUNK_COHERENCE
+        mean_sim = float(np.mean(sims)) if sims else 1.0
+        threshold = COHERENCE_RATIO * top1_score
+        return mean_sim < threshold
     except Exception:
         return False
 
@@ -158,8 +169,8 @@ def run_detectors(log_id: int):
         if any(phrase in response for phrase in UNCERTAINTY_PHRASES):
             triggered.append("llm_uncertainty")
 
-        # Rule 4 — Retrieved chunks are semantically fragmented
-        if chunks and _detect_semantic_mismatch(chunks):
+        # Rule 4 — Retrieved chunks are semantically inconsistent with top1
+        if chunks and scores and _detect_semantic_mismatch(chunks, scores[0]):
             triggered.append("semantic_mismatch")
 
         # Rule 5 — LLM answer doesn't match the retrieved evidence
