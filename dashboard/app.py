@@ -494,6 +494,70 @@ label[data-testid="stWidgetLabel"] p {
     vertical-align: middle;
     line-height: 1.4;
 }
+
+/* ── Query Log Summary Row & Alignment Fixes ── */
+/* Target the standard layout horizontal block container to sync grid height alignments */
+div[data-testid="stHorizontalBlock"] {
+    display:         flex        !important;
+    align-items:     center      !important;
+}
+
+/* Push column text elements to share an identical layout cross-axis baseline */
+div[data-testid="stHorizontalBlock"] div[data-testid="column"] {
+    display:         flex        !important;
+    align-items:     center      !important;
+}
+
+/* Target markdown fields and standard wrappers inside the horizontal blocks to keep baselines uniform */
+div[data-testid="stHorizontalBlock"] div[data-testid="column"] [data-testid="stMarkdownContainer"] p {
+    margin:          0           !important;
+    padding:         0           !important;
+    line-height:     1.2         !important;
+}
+
+/* Clean chrome box removal for text buttons inside horizontal log blocks */
+div[data-testid="stHorizontalBlock"] div[class*="st-key-ql_q_"] button {
+    background:      transparent !important;
+    border:          none        !important;
+    border-radius:   0px         !important;
+    box-shadow:      none        !important;
+    outline:         none        !important;
+    color:           #8899cc     !important;
+    font-family:     'JetBrains Mono', monospace !important;
+    font-size:       0.78rem     !important;
+    font-weight:     400         !important;
+    letter-spacing:  0.5px       !important;
+    text-transform:  none        !important;
+    text-align:      left        !important;
+    text-decoration: none        !important;
+    padding:         0           !important;
+    margin:          0           !important;
+    width:           100%        !important;
+    justify-content: flex-start  !important;
+    white-space:     nowrap      !important;
+    overflow:        hidden      !important;
+    text-overflow:   ellipsis    !important;
+    cursor:          pointer     !important;
+    display:         inline-flex !important;
+    align-items:     center      !important;
+}
+
+/* Eliminate focus or click active states from triggering box outlines */
+div[data-testid="stHorizontalBlock"] div[class*="st-key-ql_q_"] button:focus,
+div[data-testid="stHorizontalBlock"] div[class*="st-key-ql_q_"] button:active {
+    background:      transparent !important;
+    border:          none        !important;
+    outline:         none        !important;
+    box-shadow:      none        !important;
+}
+
+/* Custom text transition hue effect on hovered log elements */
+div[data-testid="stHorizontalBlock"] div[class*="st-key-ql_q_"] button:hover {
+    color:           #00f5ff     !important;
+    background:      transparent !important;
+    border:          none        !important;
+    box-shadow:      none        !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -963,20 +1027,58 @@ elif page == "Query Diagnostics":
                 st.session_state.diag_page = total_pages - 1
                 st.rerun()
 
-        summary_data = []
+        # ── click-to-select: track which query row was clicked ──
+        if "diag_selected_query_id" not in st.session_state:
+            st.session_state.diag_selected_query_id = None
+
+
+        # ── Query Log Summary – column-based table; query text is the click target ──
+        # Column proportions mirror the original table visually.
+        _COL_W  = [0.35, 3.0, 0.85, 0.85, 0.85, 0.7, 1.3]
+        _HDRS   = ["ID", "QUERY", "CTX↔Q SIM", "ANSWER↔GT", "STATUS", "LAT (s)", "TIME"]
+        _TH = ('<span style="font-family:\'JetBrains Mono\',monospace;font-size:0.65rem;'
+               'color:#00f5ff;letter-spacing:2px;text-transform:uppercase;">%s</span>')
+        _TD = ('<span style="font-family:\'JetBrains Mono\',monospace;font-size:0.78rem;'
+               'color:#8899cc;letter-spacing:0.5px;">%s</span>')
+
+        # header row
+        _hc = st.columns(_COL_W)
+        for _col, _lbl in zip(_hc, _HDRS):
+            _col.markdown(_TH % _lbl, unsafe_allow_html=True)
+
+        # data rows
         for r in rows:
-            cqs  = getattr(r, "ctx_q_sim", None)
+            cqs  = getattr(r, "ctx_q_sim",      None)
             asim = getattr(r, "answer_sem_sim", None)
-            summary_data.append({
-                "ID":            r.id,
-                "Query":         r.query,
-                "Ctx↔Q Sim":    f"{cqs:.4f}"  if cqs  is not None else "—",
-                "Answer↔GT":    f"{asim:.4f}" if asim is not None else "—",
-                "Status":        "⚠ FLAGGED" if r.flagged else "✓ OK",
-                "Latency (s)":  f"{r.latency_ms / 1000:.2f}",
-                "Time":          str(r.timestamp)[:19],
-            })
-        render_table(pd.DataFrame(summary_data))
+            cqs_str  = f"{cqs:.4f}"  if cqs  is not None else "—"
+            asim_str = f"{asim:.4f}" if asim is not None else "—"
+            lat_str  = f"{r.latency_ms / 1000:.2f}"
+            time_str = str(r.timestamp)[:19]
+            if r.flagged:
+                status_html = ('<span style="color:#ffb800;font-weight:700;'
+                               'font-family:\'JetBrains Mono\',monospace;font-size:0.78rem;">'
+                               '⚠ FLAGGED</span>')
+            else:
+                status_html = ('<span style="color:#00ff88;'
+                               'font-family:\'JetBrains Mono\',monospace;font-size:0.78rem;">'
+                               '✓ OK</span>')
+
+            dc = st.columns(_COL_W)
+            dc[0].markdown(_TD % r.id,       unsafe_allow_html=True)
+            # Query cell: text layout flex container wraps the inside link trigger
+            dc[1].markdown('<div class="ql-qbtn">', unsafe_allow_html=True)
+            if dc[1].button(
+                r.query[:120] + ("…" if len(r.query) > 120 else ""),
+                key=f"ql_q_{r.id}",
+            ):
+                st.session_state.diag_selected_query_id = r.id
+                st.rerun()
+            dc[1].markdown('</div>', unsafe_allow_html=True)
+            dc[2].markdown(_TD % cqs_str,   unsafe_allow_html=True)
+            dc[3].markdown(_TD % asim_str,  unsafe_allow_html=True)
+            dc[4].markdown(status_html,      unsafe_allow_html=True)
+            dc[5].markdown(_TD % lat_str,   unsafe_allow_html=True)
+            dc[6].markdown(_TD % time_str,  unsafe_allow_html=True)
 
         # ── Page indicator bar ──
         st.markdown(
@@ -990,9 +1092,13 @@ elif page == "Query Diagnostics":
         term_div()
         sec_header("QUERY INSPECTOR")
 
-        query_options   = {f"#{r.id} — {r.query}": r.id for r in rows}
-        selected_label  = st.selectbox("SELECT QUERY", list(query_options.keys()))
-        selected_id     = query_options[selected_label]
+        query_options  = {f"#{r.id} — {r.query}": r.id for r in rows}
+        _option_keys   = list(query_options.keys())
+        _id_list       = list(query_options.values())
+        _clicked_id    = st.session_state.get("diag_selected_query_id")
+        _sel_index     = _id_list.index(_clicked_id) if _clicked_id in _id_list else 0
+        selected_label = st.selectbox("SELECT QUERY", _option_keys, index=_sel_index)
+        selected_id    = query_options[selected_label]
         selected        = session.query(QueryLog).filter(QueryLog.id == selected_id).first()
 
         if selected:
@@ -1405,7 +1511,6 @@ elif page == "Flagged Events":
                     )
 
                 # ── Row 4: Original Query Chunks (Fixed K=5) ──
-                # Pull the original 5 chunks from the QueryLog that triggered this event
                 selected_event = session.query(LowRecallEvent).filter(
                     LowRecallEvent.id == selected_event_id
                 ).first()
@@ -1425,7 +1530,7 @@ elif page == "Flagged Events":
                 chunks_after = report.get("chunks_after_text") or []
                 dyn_k = report.get("dynamic_k")
 
-                # Deduplicate chunks (duplicates existed due to a rollback bug)
+                # Deduplicate chunks
                 def _dedup(chunks):
                     seen = set()
                     out = []
@@ -1729,7 +1834,6 @@ elif page == "Adaptation Log":
     else:
         data = []
         for r in rows:
-            # Parse diagnosis JSON for display
             try:
                 diag = json.loads(r.diagnosis or "{}")
             except Exception:
@@ -1747,7 +1851,6 @@ elif page == "Adaptation Log":
             elif outcome_display == "DEGRADED":
                 outcome_display = "✗ DEGRADED"
 
-            # Extract cascade steps from observation
             cascade_steps = obs.get("cascade_steps", [])
             steps_display = " → ".join(cascade_steps) if cascade_steps else "—"
 
@@ -1791,7 +1894,6 @@ elif page == "Adaptation Log":
                 if detectors:
                     for d in detectors:
                         st.markdown(f'<div class="flag-reason">▸ {d}</div>', unsafe_allow_html=True)
-                # Cascade steps
                 cascade_steps = obs.get("cascade_steps", [])
                 if cascade_steps:
                     sec_header("CASCADE EXECUTION")
@@ -1869,4 +1971,3 @@ elif page == "Adaptation Log":
 
 
 session.close()
-
