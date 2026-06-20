@@ -15,21 +15,15 @@ from datetime import datetime, timedelta
 
 from db.session import get_session
 from db.models import QueryLog, LowRecallEvent
+from config import settings
 
 # ── Detection thresholds — calibrated for mxbai-embed-large ──
-# NOTE: This model produces similarity scores in the 0.55–0.85 range,
-# so thresholds must be higher than typical 0.3–0.6 range models.
-SCORE_LOW          = 0.65   # rule 1: top-1 score below this → flag
-SCORE_DROP         = 0.15   # rule 2: gap rank-1 to rank-K above this → flag
-COHERENCE_RATIO    = 0.65   # rule 4: mean_pairwise_sim / top1_score must be ≥ this,
-                            # else flag. Relative threshold — adapts to retrieval
-                            # quality so healthy cross-section queries (where top1
-                            # is modest and chunks naturally spread) don't false-fire.
-                            # Edit here to tune:
-                            #   0.50 = very lenient (only severe fragmentation)
-                            #   0.65 = balanced (recommended starting point)
-                            #   0.80 = strict (may catch healthy cross-section)
-EVIDENCE_MATCH     = 0.60   # rule 5: answer↔evidence sim below this → flag
+# NOTE: These thresholds are now read from the config settings object.
+# Default values:
+#   score_low = 0.65 (rule 1: top-1 score below this → flag)
+#   score_drop = 0.15 (rule 2: gap rank-1 to rank-K above this → flag)
+#   coherence_ratio = 0.65 (rule 4: mean_pairwise_sim / top1_score must be ≥ this)
+#   evidence_match = 0.60 (rule 5: answer↔evidence sim below this → flag)
 
 UNCERTAINTY_PHRASES = [
     # Direct uncertainty
@@ -71,7 +65,7 @@ def _detect_semantic_mismatch(chunks: list[str], top1_score: float) -> bool:
     Rule 4 — Semantic Mismatch Detector (relative threshold)
     Flags when the lower-ranked chunks are inconsistent with the top match.
     Computes mean pairwise chunk similarity and compares it against
-    COHERENCE_RATIO × top1_score.
+    coherence_ratio × top1_score.
 
     Why relative instead of absolute: cross-section queries naturally pull
     chunks from different sub-topics within one document (e.g. stadium /
@@ -96,7 +90,7 @@ def _detect_semantic_mismatch(chunks: list[str], top1_score: float) -> bool:
                 sims.append(_cosine_sim(embeddings[i], embeddings[j]))
 
         mean_sim = float(np.mean(sims)) if sims else 1.0
-        threshold = COHERENCE_RATIO * top1_score
+        threshold = settings.coherence_ratio * top1_score
         return mean_sim < threshold
     except Exception:
         return False
@@ -130,7 +124,7 @@ def _detect_evidence_mismatch(answer: str, chunks: list[str]) -> bool:
             (_cosine_sim(answer_emb, ce) for ce in chunk_embs),
             default=0.0,
         )
-        return max_sim < EVIDENCE_MATCH
+        return max_sim < settings.evidence_match
     except Exception:
         return False
 
@@ -157,7 +151,7 @@ def run_detectors(log_id: int):
         triggered = []
 
         # Rule 1 — Top retrieval score is below acceptable threshold
-        if scores and scores[0] < SCORE_LOW:
+        if scores and scores[0] < settings.score_low:
             triggered.append("low_top_score")
 
         # Rule 2 — Big drop between adjacent ranks (retrieval cliffs).
@@ -166,7 +160,7 @@ def run_detectors(log_id: int):
         # (K=2 → smaller spread, K=10 → wider). Max adjacent gap is K-invariant.
         if len(scores) >= 2:
             max_gap = max(scores[i] - scores[i + 1] for i in range(len(scores) - 1))
-            if max_gap > SCORE_DROP:
+            if max_gap > settings.score_drop:
                 triggered.append("score_drop")
 
         # Rule 3 — LLM response contains uncertainty / hedging language

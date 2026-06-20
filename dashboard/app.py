@@ -19,6 +19,12 @@ from db.models import QueryLog, LowRecallEvent, EvalSnapshot, AdaptationLog, Pip
 
 init_db()
 
+from config import settings
+try:
+    settings.__init__(_env_file=".env")
+except Exception:
+    pass
+
 API_BASE = "http://localhost:8000/api/v1"
 
 st.set_page_config(
@@ -745,7 +751,7 @@ if page == "Overview":
 
     term_div()
     sec_header("DETECTION RULE MATRIX")
-    st.markdown("""
+    st.markdown(f"""
     <table class="rules-table">
         <tr>
             <th>RULE</th>
@@ -755,12 +761,12 @@ if page == "Overview":
         <tr>
             <td><code>low_top_score</code></td>
             <td>Best chunk similarity below floor</td>
-            <td class="thresh">0.65</td>
+            <td class="thresh">{settings.score_low:.2f}</td>
         </tr>
         <tr>
             <td><code>score_drop</code></td>
             <td>Largest adjacent-rank score gap (K-invariant)</td>
-            <td class="thresh">0.15</td>
+            <td class="thresh">{settings.score_drop:.2f}</td>
         </tr>
         <tr>
             <td><code>llm_uncertainty</code></td>
@@ -770,12 +776,12 @@ if page == "Overview":
         <tr>
             <td><code>semantic_mismatch</code></td>
             <td>Mean pairwise chunk sim below ratio × top1 (K-adaptive)</td>
-            <td class="thresh">0.65 × top1</td>
+            <td class="thresh">{settings.coherence_ratio:.2f} × top1</td>
         </tr>
         <tr>
             <td><code>evidence_mismatch</code></td>
             <td>Best chunk↔answer similarity below floor</td>
-            <td class="thresh">0.60</td>
+            <td class="thresh">{settings.evidence_match:.2f}</td>
         </tr>
     </table>
     """, unsafe_allow_html=True)
@@ -1174,8 +1180,8 @@ elif page == "Query Diagnostics":
                     term_div()
                     sec_header("FLAGGING ANALYSIS")
                     explanations = {
-                        "low_top_score":    "LOW_TOP_SCORE — best retrieved chunk scored below 0.65",
-                        "score_drop":       "SCORE_DROP — largest adjacent-rank score gap exceeds 0.15 (K-invariant)",
+                        "low_top_score":    f"LOW_TOP_SCORE — best retrieved chunk scored below {settings.score_low:.2f}",
+                        "score_drop":       f"SCORE_DROP — largest adjacent-rank score gap exceeds {settings.score_drop:.2f} (K-invariant)",
                         "llm_uncertainty":  "LLM_UNCERTAINTY — response contains hedging language",
                         "semantic_mismatch":"SEMANTIC_MISMATCH — retrieved chunks cover different topics",
                         "evidence_mismatch":"EVIDENCE_MISMATCH — LLM answer diverges from retrieved context",
@@ -1657,8 +1663,10 @@ elif page == "Flagged Events":
 elif page == "Pipeline Config":
     page_header("CONFIG // PIPELINE", "PIPELINE CONFIGURATION")
 
+    from config import settings
+
     # ── Current Active Config ──
-    sec_header("CURRENT ACTIVE CONFIGURATION")
+    sec_header("CURRENT ACTIVE CHUNK CONFIGURATION")
     active_cfg = session.query(PipelineConfig).filter(
         PipelineConfig.active == True
     ).order_by(PipelineConfig.created_at.desc()).first()
@@ -1679,18 +1687,21 @@ elif page == "Pipeline Config":
 
     # ── Manual Override ──
     term_div()
-    sec_header("MANUAL OVERRIDE")
+    sec_header("MANUAL OVERRIDE: CHUNK CONFIGURATION")
     backend_up = backend_status()
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        new_size = st.number_input("CHUNK SIZE", min_value=100, max_value=2000, value=250, step=50)
+        new_size = st.number_input("CHUNK SIZE", min_value=100, max_value=2000, value=int(active_cfg.chunk_size) if active_cfg else 250, step=50)
     with col2:
-        new_overlap = st.number_input("OVERLAP", min_value=0, max_value=500, value=80, step=10)
+        new_overlap = st.number_input("OVERLAP", min_value=0, max_value=500, value=int(active_cfg.chunk_overlap) if active_cfg else 80, step=10)
     with col3:
-        new_strategy = st.selectbox("STRATEGY", ["semantic", "llm", "entropy"])
+        current_strat = active_cfg.chunk_strategy if active_cfg else "semantic"
+        strat_opts = ["semantic", "llm", "entropy"]
+        strat_idx = strat_opts.index(current_strat) if current_strat in strat_opts else 0
+        new_strategy = st.selectbox("STRATEGY", strat_opts, index=strat_idx)
 
-    if st.button("▸ APPLY CONFIGURATION", type="primary", disabled=not backend_up):
+    if st.button("▸ APPLY CHUNK CONFIGURATION", type="primary", disabled=not backend_up):
         try:
             params = {
                 "chunk_size": new_size,
@@ -1705,6 +1716,132 @@ elif page == "Pipeline Config":
                 st.error(f"▸ FAILED — HTTP {resp.status_code}")
         except Exception as e:
             st.error(f"▸ ERROR — {e}")
+
+    # ── Unified System Settings ──
+    term_div()
+    sec_header("SYSTEM & REPAIR THRESHOLD SETTINGS")
+
+    def save_system_env(updates: dict):
+        env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
+        
+        # Read existing variables
+        lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                
+        # Parse existing variables
+        env_dict = {}
+        for line in lines:
+            line_strip = line.strip()
+            if line_strip and not line_strip.startswith("#") and "=" in line_strip:
+                k, v = line_strip.split("=", 1)
+                env_dict[k.strip()] = v.strip()
+                
+        # Apply updates
+        for k, v in updates.items():
+            env_dict[k] = str(v)
+            
+        # Write back
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.write("# Self-Organising RAG — Unified System Configurations\n")
+            for k, v in env_dict.items():
+                f.write(f"{k}={v}\n")
+                
+        # Also update the singleton in memory in the current process
+        for k, v in updates.items():
+            attr_name = k.lower()
+            if hasattr(settings, attr_name):
+                orig_val = getattr(settings, attr_name)
+                try:
+                    if isinstance(orig_val, bool):
+                        val = str(v).lower() in ("true", "1", "yes")
+                    elif isinstance(orig_val, int):
+                        val = int(v)
+                    elif isinstance(orig_val, float):
+                        val = float(v)
+                    else:
+                        val = str(v)
+                    setattr(settings, attr_name, val)
+                except Exception:
+                    setattr(settings, attr_name, v)
+
+    with st.form("system_config_form"):
+        st.markdown("<h3 style='margin-top:10px; color:var(--cyan);'>1. Models & Provider Setup</h3>", unsafe_allow_html=True)
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            primary_llm = st.text_input("PRIMARY LLM MODEL", value=settings.llm_model_name)
+            embed_model = st.text_input("EMBEDDING MODEL", value=settings.embedding_model_name)
+        with col_m2:
+            fallback_llm = st.text_input("FALLBACK LLM MODEL", value=settings.fallback_llm_model)
+            ollama_url = st.text_input("OLLAMA BASE URL", value=settings.ollama_base_url)
+
+        st.markdown("<h3 style='margin-top:20px; color:var(--cyan);'>2. Auto-Worker Trigger Settings</h3>", unsafe_allow_html=True)
+        col_aw1, col_aw2, col_aw3 = st.columns(3)
+        with col_aw1:
+            p_min = st.number_input("MIN PENDING EVENTS", min_value=1, max_value=50, value=settings.pending_min, step=1)
+        with col_aw2:
+            p_ratio = st.slider("PENDING EVENTS RATIO", min_value=0.0, max_value=1.0, value=settings.pending_ratio, step=0.05)
+        with col_aw3:
+            p_interval = st.number_input("DAEMON POLL INTERVAL (SEC)", min_value=1, max_value=300, value=settings.poll_interval_seconds, step=1)
+
+        st.markdown("<h3 style='margin-top:20px; color:var(--cyan);'>3. Low Recall Trigger Thresholds (Detectors)</h3>", unsafe_allow_html=True)
+        col_det1, col_det2 = st.columns(2)
+        with col_det1:
+            s_low = st.slider("TOP-1 SCORE FLOOR (RULE 1)", min_value=0.0, max_value=1.0, value=settings.score_low, step=0.05)
+            s_drop = st.slider("ADJACENT SCORE DROP GAP (RULE 2)", min_value=0.0, max_value=1.0, value=settings.score_drop, step=0.05)
+        with col_det2:
+            s_coh = st.slider("SEMANTIC COHERENCE RATIO (RULE 4)", min_value=0.0, max_value=1.0, value=settings.coherence_ratio, step=0.05)
+            s_ev = st.slider("ANSWER-EVIDENCE MATCH FLOOR (RULE 5)", min_value=0.0, max_value=1.0, value=settings.evidence_match, step=0.05)
+
+        st.markdown("<h3 style='margin-top:20px; color:var(--cyan);'>4. Quality Metrics & Repair Thresholds</h3>", unsafe_allow_html=True)
+        col_rep1, col_rep2 = st.columns(2)
+        with col_rep1:
+            p_rel = st.slider("CHUNK RELEVANCE SIM FLOOR (PRECISION@K)", min_value=0.0, max_value=1.0, value=settings.precision_relevance_threshold, step=0.05)
+            s_suff = st.slider("CONTEXT SUFFICIENCY SIM FLOOR", min_value=0.0, max_value=1.0, value=settings.sufficiency_threshold, step=0.05)
+            h_ground = st.slider("CLAIM GROUNDING SIM FLOOR (HALLUCINATION)", min_value=0.0, max_value=1.0, value=settings.hallucination_grounding_threshold, step=0.05)
+        with col_rep2:
+            p_thresh = st.slider("DECISION ENGINE: PRECISION THRESHOLD", min_value=0.0, max_value=1.0, value=settings.precision_threshold, step=0.05)
+            h_thresh = st.slider("DECISION ENGINE: HALLUCINATION THRESHOLD", min_value=0.0, max_value=1.0, value=settings.hallucination_threshold, step=0.05)
+            c_drop = st.slider("DYNAMIC K SCORE CLIFF DROP GAP", min_value=0.0, max_value=1.0, value=settings.score_cliff_threshold, step=0.01)
+        
+        col_prom1, col_prom2 = st.columns(2)
+        with col_prom1:
+            prom_thresh = st.number_input("SUCCESSES REQUIRED FOR S1 PROMOTION", min_value=1, max_value=20, value=settings.promotion_threshold, step=1)
+        with col_prom2:
+            gt_path = st.text_input("GROUND TRUTH DATASET PATH", value=settings.gt_dataset_path)
+
+        st.markdown("<div style='margin-top:15px;'></div>", unsafe_allow_html=True)
+        save_btn = st.form_submit_button("▸ SAVE & PERSIST SYSTEM CONFIGURATION")
+
+        if save_btn:
+            updates = {
+                "LLM_MODEL_NAME": primary_llm.strip(),
+                "FALLBACK_LLM_MODEL": fallback_llm.strip(),
+                "EMBEDDING_MODEL_NAME": embed_model.strip(),
+                "OLLAMA_BASE_URL": ollama_url.strip(),
+                "PENDING_MIN": int(p_min),
+                "PENDING_RATIO": float(p_ratio),
+                "POLL_INTERVAL_SECONDS": int(p_interval),
+                "SCORE_LOW": float(s_low),
+                "SCORE_DROP": float(s_drop),
+                "COHERENCE_RATIO": float(s_coh),
+                "EVIDENCE_MATCH": float(s_ev),
+                "PRECISION_RELEVANCE_THRESHOLD": float(p_rel),
+                "SUFFICIENCY_THRESHOLD": float(s_suff),
+                "HALLUCINATION_GROUNDING_THRESHOLD": float(h_ground),
+                "PRECISION_THRESHOLD": float(p_thresh),
+                "HALLUCINATION_THRESHOLD": float(h_thresh),
+                "SCORE_CLIFF_THRESHOLD": float(c_drop),
+                "PROMOTION_THRESHOLD": int(prom_thresh),
+                "GT_DATASET_PATH": gt_path.strip(),
+            }
+            try:
+                save_system_env(updates)
+                st.success("▸ SYSTEM CONFIGURATION SAVED AND PERSISTED TO .ENV SUCCESSFULLY!")
+                st.info("▸ Note: Uvicorn backend will automatically reload. The Auto-Worker daemon will pick up threshold changes within its next poll cycle.")
+            except Exception as e:
+                st.error(f"▸ FAILED TO SAVE SYSTEM CONFIGURATION — {e}")
 
     # ── Config History ──
     term_div()

@@ -121,10 +121,12 @@ def diagnose(event, query_log) -> dict:
     root_cause = "unknown"
     reasoning = ""
 
+    from config import settings
+
     # Priority 1: High hallucination → tighten chunks
-    if (hall_rate is not None and hall_rate > 0.3) or "evidence_mismatch" in triggers:
+    if (hall_rate is not None and hall_rate > settings.hallucination_threshold) or "evidence_mismatch" in triggers:
         root_cause = "high_hallucination"
-        reasoning = (f"Hallucination rate {hall_rate or 'N/A'} exceeds threshold. "
+        reasoning = (f"Hallucination rate {hall_rate or 'N/A'} exceeds threshold ({settings.hallucination_threshold}). "
                      f"Evidence mismatch detected. Chunks likely contain too much "
                      f"irrelevant text confusing the LLM.")
         severity_score = max(severity_score, 0.8)
@@ -132,7 +134,7 @@ def diagnose(event, query_log) -> dict:
     # Priority 2: Low precision on short factual queries → reduce chunk size
     elif q_category == "short_factual" and (
         "low_top_score" in triggers or
-        (ret_precision is not None and ret_precision < 0.4)
+        (ret_precision is not None and ret_precision < settings.precision_threshold)
     ):
         root_cause = "chunk_too_large"
         reasoning = (f"Short factual query with low precision ({ret_precision or 'N/A'}). "

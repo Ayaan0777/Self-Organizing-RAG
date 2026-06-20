@@ -52,7 +52,8 @@ DEFAULT_K_BOUNDS = (3, 6)
 
 # Score thresholds for dynamic K pruning
 SCORE_NOISE_FLOOR = 0.25   # chunks below this are noise
-SCORE_CLIFF_THRESHOLD = 0.12  # gap that signals a quality cliff
+# cliff threshold is read dynamically from settings.score_cliff_threshold
+
 
 
 def _dynamic_k_selection(
@@ -88,9 +89,10 @@ def _dynamic_k_selection(
 
     # Stage 3: Score cliff detection
     best_cliff_k = len(valid)  # default: keep all valid chunks
+    score_cliff_thresh = settings.score_cliff_threshold
     for i in range(1, len(valid)):
         gap = valid[i - 1] - valid[i]
-        if gap > SCORE_CLIFF_THRESHOLD:
+        if gap > score_cliff_thresh:
             best_cliff_k = i  # cut AFTER the cliff
             break
 

@@ -13,12 +13,7 @@ All metrics are embedding-based for speed (no extra LLM calls).
 import re
 import numpy as np
 from services.llm_factory import get_embeddings
-
-
-# ── Thresholds (tunable via config.py) ──
-PRECISION_RELEVANCE_THRESHOLD = 0.50   # chunk↔ground_truth sim above this = relevant
-SUFFICIENCY_THRESHOLD         = 0.70   # context↔ground_truth sim above this = sufficient
-HALLUCINATION_GROUNDING_THRESHOLD = 0.55  # claim↔context sim above this = grounded
+from config import settings
 
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
@@ -42,7 +37,7 @@ def _get_embedding(text: str) -> np.ndarray:
 def retrieval_precision_at_k(
     chunks: list[str],
     ground_truths: list[str],
-    threshold: float = PRECISION_RELEVANCE_THRESHOLD,
+    threshold: float = None,
 ) -> float:
     """
     Measures what fraction of retrieved chunks are relevant to the answer.
@@ -58,6 +53,9 @@ def retrieval_precision_at_k(
     Returns:
         Precision score (0.0–1.0). E.g., 0.6 means 3 out of 5 chunks are relevant.
     """
+    if threshold is None:
+        threshold = settings.precision_relevance_threshold
+
     if not chunks or not ground_truths:
         return 0.0
 
@@ -86,7 +84,7 @@ def retrieval_precision_at_k(
 def retrieval_recall_at_k(
     chunks: list[str],
     ground_truths: list[str],
-    threshold: float = PRECISION_RELEVANCE_THRESHOLD,
+    threshold: float = None,
 ) -> float:
     """
     Measures what fraction of ground-truth answers are covered by at least
@@ -108,6 +106,9 @@ def retrieval_recall_at_k(
         Recall score (0.0–1.0). E.g., 0.5 means half the ground truths
         are covered by at least one retrieved chunk.
     """
+    if threshold is None:
+        threshold = settings.precision_relevance_threshold
+
     if not chunks or not ground_truths:
         return 0.0
 
@@ -136,7 +137,7 @@ def retrieval_recall_at_k(
 def context_sufficiency(
     chunks: list[str],
     ground_truths: list[str],
-    threshold: float = SUFFICIENCY_THRESHOLD,
+    threshold: float = None,
 ) -> bool:
     """
     Checks whether the retrieved context contains enough information
@@ -154,6 +155,9 @@ def context_sufficiency(
     Returns:
         True if context is sufficient, False otherwise.
     """
+    if threshold is None:
+        threshold = settings.sufficiency_threshold
+
     if not chunks or not ground_truths:
         return False
 
@@ -195,7 +199,7 @@ def _split_into_claims(answer: str) -> list[str]:
 def hallucination_rate(
     answer: str,
     chunks: list[str],
-    threshold: float = HALLUCINATION_GROUNDING_THRESHOLD,
+    threshold: float = None,
 ) -> float:
     """
     Measures the fraction of claims in the answer that are NOT grounded
@@ -216,6 +220,9 @@ def hallucination_rate(
         Hallucination rate (0.0–1.0). E.g., 0.2 means 20% of claims are ungrounded.
         Returns 0.0 if there are no claims to check.
     """
+    if threshold is None:
+        threshold = settings.hallucination_grounding_threshold
+
     if not answer or not chunks:
         return 0.0
 

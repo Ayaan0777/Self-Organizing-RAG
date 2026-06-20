@@ -15,18 +15,24 @@ import time
 import logging
 from db.session import get_session
 from db.models import LowRecallEvent, QueryLog
-
-PENDING_MIN = 5
-PENDING_RATIO = 0.30
-POLL_INTERVAL_SECONDS = 5
+from config import settings
 
 
 def run_batch_worker():
     print("🚀 [Batch-Worker] Background Daemon initialized...")
-    print(f"📊 Trigger: ≥{PENDING_MIN} pending events AND ≥{int(PENDING_RATIO*100)}% of total queries flagged.")
-    print(f"📡 Monitoring database state every {POLL_INTERVAL_SECONDS} seconds...\n")
+    print("📡 Monitoring database state for threshold triggers...\n")
 
     while True:
+        try:
+            # Re-read .env dynamically so dashboard changes apply immediately
+            settings.__init__(_env_file=".env")
+        except Exception as e:
+            print(f"[Batch-Worker] Warning: failed to reload settings: {e}")
+
+        pending_min = settings.pending_min
+        pending_ratio = settings.pending_ratio
+        poll_interval = settings.poll_interval_seconds
+
         session = get_session()
         try:
             # 1. Count total queries (denominator for ratio)
@@ -43,8 +49,8 @@ def run_batch_worker():
             pending_count = len(pending_events)
 
             # 3. Check trigger conditions
-            count_ok = pending_count >= PENDING_MIN
-            ratio_ok = total_queries > 0 and (pending_count / total_queries) >= PENDING_RATIO
+            count_ok = pending_count >= pending_min
+            ratio_ok = total_queries > 0 and (pending_count / total_queries) >= pending_ratio
 
             if count_ok and ratio_ok:
                 ratio_pct = round(pending_count / total_queries * 100, 1)
@@ -117,9 +123,9 @@ def run_batch_worker():
                         ratio_pct = 0.0
                     reasons = []
                     if not count_ok:
-                        reasons.append(f"count={pending_count}/{PENDING_MIN}")
+                        reasons.append(f"count={pending_count}/{pending_min}")
                     if not ratio_ok:
-                        reasons.append(f"ratio={ratio_pct}%/{int(PENDING_RATIO*100)}%")
+                        reasons.append(f"ratio={ratio_pct}%/{int(pending_ratio*100)}%")
                     print(
                         f"⏳ Waiting: {pending_count} pending events, "
                         f"but threshold not met ({', '.join(reasons)})"
@@ -130,7 +136,7 @@ def run_batch_worker():
         finally:
             session.close()
 
-        time.sleep(POLL_INTERVAL_SECONDS)
+        time.sleep(poll_interval)
 
 
 if __name__ == "__main__":

@@ -45,8 +45,8 @@ from detector.decision_engine import diagnose, STRATEGY_TO_RECHUNK
 from services.llm_factory import get_vector_store, get_fallback_llm
 from controllers.metrics import classify_question
 from controllers.retrieval import _resolve_main_k
+from config import settings
 
-PROMOTION_THRESHOLD = 5
 
 
 # ══════════════════════════════════════════════════════════════
@@ -120,10 +120,11 @@ def maybe_promote_dynamic_k():
     """Promotes Strategy 1 (dynamic K) to the main pipeline if threshold met."""
     session = get_session()
     try:
+        promotion_threshold = settings.promotion_threshold
         counter = session.query(StrategyCounter).filter(
             StrategyCounter.strategy == "s1_dynamic_k"
         ).first()
-        if (counter and counter.success_count >= PROMOTION_THRESHOLD
+        if (counter and counter.success_count >= promotion_threshold
                 and not is_flag_set("dynamic_k_promoted")):
             _set_flag("dynamic_k_promoted", True)
             logging.info(
