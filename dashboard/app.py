@@ -665,7 +665,7 @@ session = _dashboard_session()
 page = st.sidebar.radio(
     "NAVIGATE",
     ["Overview", "Ingest Document", "Ask Query", "Add Chunks", "Query Diagnostics",
-     "Flagged Events", "Eval History", "Pipeline Config", "Adaptation Log"],
+     "Flagged Events", "Pipeline Config", "Adaptation Log"],
 )
 
 st.sidebar.markdown("---")
@@ -1649,46 +1649,6 @@ elif page == "Flagged Events":
             st.error("TIMEOUT - repair report request took too long")
         except Exception as e:
             st.error(f"ERROR - {e}")
-elif page == "Eval History":
-    page_header("ANALYSIS // EVAL", "EVALUATION HISTORY")
-
-    rows = session.query(EvalSnapshot).order_by(EvalSnapshot.timestamp.desc()).limit(100).all()
-
-    if not rows:
-        st.info("▸ NO EVAL SNAPSHOTS — run: python run_evaluation.py")
-    else:
-        data = [{
-            "Namespace":         r.namespace,
-            "LLM":               r.llm,
-            "Embeddings":        r.embeddings,
-            "ROUGE-L":           r.rouge_l,
-            "Semantic Sim":      r.sem_sim,
-            "Ctx↔Query":        r.ctx_q_sim,
-            "Ctx↔GT":           r.ctx_gt_sim,
-            "Ret. Precision":    f"{r.retrieval_precision:.2%}" if r.retrieval_precision is not None else "—",
-            "Ctx Sufficiency":   f"{r.context_sufficiency:.2%}" if r.context_sufficiency is not None else "—",
-            "Hallucination":     f"{r.hallucination_rate:.2%}" if r.hallucination_rate is not None else "—",
-            "Time":              str(r.timestamp)[:19],
-        } for r in rows]
-        render_table(pd.DataFrame(data))
-
-        # Trend chart for new metrics across evaluation runs
-        if len(rows) > 1:
-            term_div()
-            sec_header("METRIC TRENDS ACROSS EVALUATIONS")
-            trend = []
-            for r in reversed(rows):
-                entry = {"Run": str(r.timestamp)[:16]}
-                if r.retrieval_precision is not None:
-                    entry["Retrieval Precision"] = r.retrieval_precision
-                if r.hallucination_rate is not None:
-                    entry["Hallucination Rate"] = r.hallucination_rate
-                if r.sem_sim is not None:
-                    entry["Semantic Similarity"] = r.sem_sim
-                trend.append(entry)
-            if trend:
-                trend_df = pd.DataFrame(trend).set_index("Run")
-                st.line_chart(trend_df, height=280)
 
 
 # ══════════════════════════════════════════════════════════════════════════
