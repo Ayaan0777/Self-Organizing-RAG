@@ -19,3 +19,4 @@ python-multipart
 streamlit
 requests
 sqlalchemy>=2.0
+streamlit-autorefresh

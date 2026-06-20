@@ -27,6 +27,11 @@ except Exception:
 
 API_BASE = "http://localhost:8000/api/v1"
 
+from streamlit_autorefresh import st_autorefresh
+# Auto-refresh the dashboard every 10 seconds to fetch updated metrics/data from backend,
+# while preserving the current selected sidebar page and session state.
+st_autorefresh(interval=10000, key="auto_refresh_dashboard")
+
 st.set_page_config(
     page_title="AUTO-RAG // DIAGNOSTIC",
     page_icon="⬡",
