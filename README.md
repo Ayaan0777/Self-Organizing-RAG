@@ -120,17 +120,7 @@ HPE_CPP/
 │   ├── clear_db.py
 │   └── del_query.py
 ├── dashboard/app.py          # Streamlit, 9 pages
-├── dataset/long_ans.json     # GT dataset (default)
-├── unused/                   # Legacy 384-dim scripts — do not run
-└── MD_files/                 # All design + audit documentation
-    ├── explanation.md        # Full system explanation
-    ├── claude.md             # Cascade implementation plan
-    ├── bugs.md               # Bug audit + resolution log
-    ├── walkthrough.md        # Cascade implementation walkthrough
-    ├── notes_compare.md      # Spec-vs-built coverage
-    ├── instruction.md        # Variable chunk size spec
-    ├── stages_explained.md   # Stage 1-4 reference
-    └── implementation_plan.md
+└── dataset/long_ans.json     # GT dataset (default)
 ```
 
 ---
@@ -195,31 +185,3 @@ the query embedding. Further gains require a smaller LLM (e.g. `llama3.2:3b`,
 `gemma3:4b`) or GPU acceleration — mistral is the floor.
 
 ---
-
-## Documentation map
-
-All design notes and audit logs are under `MD_files/`. Open them directly
-or follow the links below.
-
-| File | Purpose |
-|---|---|
-| [MD_files/explanation.md](MD_files/explanation.md) | Full system explanation — architecture, every module, mermaid diagrams, end-to-end flow |
-| [MD_files/claude.md](MD_files/claude.md) | Original cascade implementation plan (historical reference) |
-| [MD_files/bugs.md](MD_files/bugs.md) | Bug audit log — 23 bugs categorized, 20 fixed, 3 explicitly ignored |
-| [MD_files/notes_compare.md](MD_files/notes_compare.md) | Coverage of the original deep-dive spec vs. what was built |
-| [MD_files/walkthrough.md](MD_files/walkthrough.md) | Cascade implementation walkthrough |
-| [MD_files/instruction.md](MD_files/instruction.md) | Variable chunk size ingestion spec |
-| [MD_files/stages_explained.md](MD_files/stages_explained.md) | Stage 1-4 (DETECT / MEASURE / DECIDE / ACT) reference |
-
----
-
-## Project status
-
-All 7 core components from the original deep-dive spec are present. All 6
-monthly milestones complete. See [notes_compare.md](notes_compare.md) for
-the spec-vs-built breakdown. The architecture goes beyond the brief in
-several places — ordered cascade with promotion, GT-backed inline metrics,
-K-adaptive detection, snapshot rollback — that weren't in the original
-plan.
-
-For the prioritized list of remaining cleanup items, see [bugs.md](bugs.md).
