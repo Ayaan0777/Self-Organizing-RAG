@@ -25,18 +25,28 @@ try:
 except Exception:
     pass
 
-API_BASE = "http://localhost:8000/api/v1"
-
-from streamlit_autorefresh import st_autorefresh
-# Auto-refresh the dashboard every 10 seconds to fetch updated metrics/data from backend,
-# while preserving the current selected sidebar page and session state.
-st_autorefresh(interval=10000, key="auto_refresh_dashboard")
+API_BASE = os.getenv("BACKEND_API_URL", "http://localhost:8000/api/v1")
 
 st.set_page_config(
     page_title="AUTO-RAG // DIAGNOSTIC",
     page_icon="⬡",
     layout="wide",
 )
+
+# ── NAVIGATION & AUTO-REFRESH ──
+page = st.sidebar.radio(
+    "NAVIGATE",
+    ["Overview", "Ingest Document", "Ask Query", "Add Chunks", "Query Diagnostics",
+     "Flagged Events", "Pipeline Config", "Adaptation Log"],
+)
+
+# Enable auto-refresh (10s) only on read-only monitoring pages to prevent interrupting form inputs
+refresh_pages = ["Overview", "Flagged Events", "Adaptation Log", "Query Diagnostics"]
+if page in refresh_pages:
+    # enable_refresh = st.sidebar.checkbox("Auto-refresh (10s)", value=True, key="enable_refresh")
+    # if enable_refresh:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=10000, key="auto_refresh_dashboard")
 
 # ══════════════════════════════════════════════════════════════════════════
 #  CYBERPUNK TERMINAL CSS
@@ -649,7 +659,7 @@ def chunk_card(i, chunk, score):
         card_cls, badge_cls, label = "score-mid",  "badge-mid",  "MED"
     else:
         card_cls, badge_cls, label = "score-low",  "badge-low",  "LOW"
-    display_text = chunk[:500] + ("…" if len(chunk) > 500 else "")
+    display_text = chunk[:1000] + ("…" if len(chunk) > 1000 else "")
     st.markdown(f"""
     <div class="chunk-card {card_cls}">
         <div class="chunk-rank">
@@ -673,12 +683,6 @@ def _dashboard_session():
 
 session = _dashboard_session()
 
-page = st.sidebar.radio(
-    "NAVIGATE",
-    ["Overview", "Ingest Document", "Ask Query", "Add Chunks", "Query Diagnostics",
-     "Flagged Events", "Pipeline Config", "Adaptation Log"],
-)
-
 st.sidebar.markdown("---")
 st.sidebar.markdown(f"<span style='font-size:0.65rem;color:#2a2a60;letter-spacing:2px;'>v3 // TERMINAL EDITION</span>", unsafe_allow_html=True)
 
@@ -687,7 +691,7 @@ st.sidebar.markdown(f"<span style='font-size:0.65rem;color:#2a2a60;letter-spacin
 #  OVERVIEW
 # ══════════════════════════════════════════════════════════════════════════
 if page == "Overview":
-    page_header("SYS // MONITOR", "SYSTEM OVERVIEW")
+    page_header("MONITORING // OVERVIEW", "SYSTEM OVERVIEW")
 
     total    = session.query(QueryLog).count()
     flagged  = session.query(QueryLog).filter(QueryLog.flagged == True).count()
@@ -706,22 +710,22 @@ if page == "Overview":
     res_rate  = round(resolved / flagged * 100, 1) if flagged else 0
     st.caption(f"FLAG RATE: {flag_rate}%  ·  RESOLUTION RATE: {res_rate}%  ·  UNFIXABLE: {unfixable}")
 
-    # ── Dynamic K Promotion Status ──
-    dk_flag = session.query(RuntimeFlag).filter(
-        RuntimeFlag.name == "dynamic_k_promoted"
-    ).first()
-    if dk_flag and dk_flag.value:
-        st.markdown(
-            '<div class="status-dot" style="margin:8px 0"><span class="dot dot-green"></span> '
-            'DYNAMIC K PROMOTED — main pipeline uses category-based K selection</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            '<div class="status-dot" style="margin:8px 0"><span class="dot dot-amber"></span> '
-            'DYNAMIC K NOT YET PROMOTED — main pipeline uses fixed K=5</div>',
-            unsafe_allow_html=True,
-        )
+    # # ── Dynamic K Promotion Status ──
+    # dk_flag = session.query(RuntimeFlag).filter(
+    #     RuntimeFlag.name == "dynamic_k_promoted"
+    # ).first()
+    # if dk_flag and dk_flag.value:
+    #     st.markdown(
+    #         '<div class="status-dot" style="margin:8px 0"><span class="dot dot-green"></span> '
+    #         'DYNAMIC K PROMOTED — main pipeline uses category-based K selection</div>',
+    #         unsafe_allow_html=True,
+    #     )
+    # else:
+    #     st.markdown(
+    #         '<div class="status-dot" style="margin:8px 0"><span class="dot dot-amber"></span> '
+    #         'DYNAMIC K NOT YET PROMOTED — main pipeline uses fixed K=5</div>',
+    #         unsafe_allow_html=True,
+    #     )
 
 
     term_div()
@@ -933,8 +937,8 @@ elif page == "Add Chunks":
     col1, col2 = st.columns([2, 1])
     with col1:
         source_name = st.text_input("SOURCE NAME", value="manual-paste")
-    with col2:
-        ns_chunk = st.text_input("NAMESPACE", value="", key="chunk_ns")
+    # with col2:
+    #     ns_chunk = st.text_input("NAMESPACE", value="", key="chunk_ns")
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -950,8 +954,8 @@ elif page == "Add Chunks":
                     "source": source_name,
                     "ingest": ingest_btn,
                 }
-                if ns_chunk.strip():
-                    payload["namespace"] = ns_chunk.strip()
+                # if ns_chunk.strip():
+                #     payload["namespace"] = ns_chunk.strip()
 
                 resp = requests.post(f"{API_BASE}/add-chunks", json=payload, timeout=120)
                 if resp.status_code == 200:
@@ -961,14 +965,14 @@ elif page == "Add Chunks":
                     sec_header(f"RESULT: {result['num_chunks']} CHUNKS ({result.get('size_range', '')})")
 
                     if ingest_btn and result.get("ingested"):
-                        st.success(f"▸ Ingested to namespace: {result.get('namespace', 'default')}")
+                        st.success(f"▸ Ingested to namespace: {result.get('namespace', 'content')}")
 
                     for i, c in enumerate(chunks_data):
                         score_cls = "score-high" if c['chars'] >= 500 else ("score-mid" if c['chars'] >= 200 else "score-low")
                         st.markdown(f"""
                         <div class="chunk-card {score_cls}">
                             <div class="chunk-rank">CHUNK_{i+1:02d} &nbsp;·&nbsp; {c['chars']} CHARS</div>
-                            <div class="chunk-text">{c['content'][:400]}{'…' if len(c['content']) > 400 else ''}</div>
+                            <div class="chunk-text">{c['content'][:1000]}{'…' if len(c['content']) > 1000 else ''}</div>
                         </div>
                         """, unsafe_allow_html=True)
                 else:
@@ -1601,7 +1605,7 @@ elif page == "Flagged Events":
                         </div>
                         """, unsafe_allow_html=True)
                         for i, chunk in enumerate(original_chunks[:5]):
-                            preview = chunk[:300] + ("..." if len(chunk) > 300 else "")
+                            preview = chunk[:1000] + ("..." if len(chunk) > 1000 else "")
                             st.markdown(f"""
                             <div style="background: rgba(0,245,255,0.03); border-left: 3px solid var(--cyan);
                                         padding: 10px 14px; margin-bottom: 6px; border-radius: 0 4px 4px 0;
@@ -1630,7 +1634,7 @@ elif page == "Flagged Events":
                     """, unsafe_allow_html=True)
                     if chunks_after:
                         for i, chunk in enumerate(chunks_after):
-                            preview = chunk[:300] + ("..." if len(chunk) > 300 else "")
+                            preview = chunk[:1000] + ("..." if len(chunk) > 1000 else "")
                             border_color = "var(--green)" if is_resolved else "var(--red)"
                             bg_color = "rgba(0,220,130,0.05)" if is_resolved else "rgba(255,60,60,0.05)"
                             st.markdown(f"""
@@ -1685,8 +1689,8 @@ elif page == "Pipeline Config":
         st.caption(f"Config ID: {active_cfg.id}  ·  Created: {str(active_cfg.created_at)[:19]}")
     else:
         c1, c2, c3 = st.columns(3)
-        c1.metric("CHUNK SIZE", 250)
-        c2.metric("CHUNK OVERLAP", 80)
+        c1.metric("CHUNK SIZE", 1000)
+        c2.metric("CHUNK OVERLAP", 300)
         c3.metric("STRATEGY", "SEMANTIC")
         st.caption("Using system defaults — no custom config saved yet.")
 

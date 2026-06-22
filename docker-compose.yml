@@ -17,6 +17,7 @@ services:
       - "8000:8000"
 
     volumes:
+      - .:/app
       - rag_db:/app/db
 
     restart: unless-stopped
@@ -31,6 +32,7 @@ services:
       - .env
 
     volumes:
+      - .:/app
       - rag_db:/app/db
 
     depends_on:
@@ -50,10 +52,14 @@ services:
     env_file:
       - .env
 
+    environment:
+      - BACKEND_API_URL=http://api:8000/api/v1
+
     ports:
       - "8501:8501"
 
     volumes:
+      - .:/app
       - rag_db:/app/db
 
     depends_on:

@@ -41,3 +41,8 @@ Desktop.ini
 *.db
 *.sqlite
 *.sqlite3
+
+# Project-specific ignored folders
+unused/
+MD_files/
+results/
