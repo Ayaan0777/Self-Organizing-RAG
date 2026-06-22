@@ -1,0 +1,1046 @@
+================================================================================
+         SELF-ORGANISING RAG — 50-MINUTE DEMO SCRIPT
+         Team of 5 — 10 minutes each
+================================================================================
+
+PREREQUISITES (before the demo):
+  1. Backend running:     uvicorn main:app --reload
+  2. Dashboard running:   streamlit run dashboard/app.py
+  3. Auto-worker running: python auto_worker.py
+  4. Ollama running:      ollama serve (with mistral, gemma3:27b, mxbai-embed-large)
+  5. Pinecone configured: .env file with API key, index name, namespace
+  6. Have a sample PDF/TXT document ready to ingest (e.g., a textbook chapter)
+  7. Browser open with:   Dashboard (localhost:8501) and Swagger (localhost:8000/docs)
+
+TEAM MEMBER ASSIGNMENTS:
+  ┌──────────────────────────────────────────────────────────────┐
+  │  MEMBER 1 (0:00 - 10:00)  │  Introduction + Ingestion      │
+  │  MEMBER 2 (10:00 - 20:00) │  Retrieval Gate + Dynamic K    │
+  │  MEMBER 3 (20:00 - 30:00) │  5-Rule Detection System       │
+  │  MEMBER 4 (30:00 - 40:00) │  Repair Cascade + Auto-Worker  │
+  │  MEMBER 5 (40:00 - 50:00) │  Auto-Indexer + Eval + Wrap-up │
+  └──────────────────────────────────────────────────────────────┘
+
+################################################################################
+##                                                                            ##
+##  MEMBER 1 — INTRODUCTION + INGESTION PIPELINE                              ##
+##  Time: 0:00 - 10:00 (10 minutes)                                           ##
+##                                                                            ##
+################################################################################
+
+================================================================================
+[0:00 - 3:00]  INTRODUCTION — What is Self-Organising RAG?
+================================================================================
+
+[SHOW: Title slide or Dashboard Overview page]
+
+SPEAK:
+"Hello everyone. Today our team will be demonstrating our Self-Organising
+RAG system — a RAG pipeline that can monitor, detect, and heal its own
+failures autonomously.
+
+RAG stands for Retrieval-Augmented Generation. It's a technique where an
+LLM answers questions using externally retrieved documents instead of
+relying only on its internal training data. You upload documents, they
+get split into chunks and stored as embeddings in a vector database,
+and when a user asks a question, the system retrieves the most relevant
+chunks and feeds them to the LLM as context.
+
+But standard RAG systems have critical problems:
+  - Fixed chunk sizes mean some chunks are too large (dilute the answer)
+    and some are too small (lose context)
+  - They always retrieve the same number of chunks regardless of query
+    complexity
+  - They have no way to detect when they give a bad answer
+  - They have no way to fix themselves when things go wrong
+
+Our system solves ALL of these with a self-organising pipeline. Let me
+give you a quick overview before we dive into each component."
+
+[SHOW: Dashboard Overview page — point out the metrics: Total Queries,
+Healthy, Flagged, Resolved]
+
+"This is our Streamlit monitoring dashboard. It shows real-time health of
+the entire pipeline. You can see:
+  - Total queries processed
+  - How many were healthy (no issues detected)
+  - How many were flagged (one or more detection rules triggered)
+  - How many were resolved (automatically repaired by the system)
+
+The dashboard is built with Streamlit and pulls data from our SQLite
+database. It has pages for query logs, flagged events, repair reports,
+evaluation history, and pipeline configuration."
+
+[SHOW: Architecture diagram or whiteboard overview]
+
+"Here's the high-level architecture:
+
+  1. Documents come in through the INGEST endpoint
+  2. They're chunked with variable sizing and stored in Pinecone
+  3. Queries pass through a RETRIEVAL GATE that filters chitchat
+  4. Real questions go through DYNAMIC K RETRIEVAL
+  5. After every answer, 5 DETECTION RULES check for problems
+  6. A background DAEMON monitors failure rates
+  7. When failures accumulate, a 4-STRATEGY REPAIR CASCADE kicks in
+  8. An AUTO-INDEXER keeps embeddings fresh over time
+  9. The whole thing is measured by a 7-METRIC EVALUATION pipeline
+
+Our tech stack:
+  - FastAPI for the backend (main.py)
+  - Ollama for local LLM inference (mistral + gemma3:27b)
+  - mxbai-embed-large for embeddings (1024 dimensions)
+  - Pinecone as the vector database
+  - SQLite for logging, events, repair reports, and provenance
+  - Streamlit for the monitoring dashboard
+
+Now let me walk you through how documents get into the system."
+
+================================================================================
+[3:00 - 7:00]  FEATURE 1 — Variable Chunk Size Ingestion
+================================================================================
+
+[SHOW: Dashboard → "Ingest Document" page]
+
+SPEAK:
+"The first step in any RAG system is document ingestion — getting your
+documents into the vector database. Most RAG systems use a naive approach:
+split the text at every 500 or 1000 characters regardless of content.
+Our system is smarter."
+
+[ACTION: Upload a PDF document through the dashboard]
+
+"I'm uploading a document now. Let me explain what happens behind the
+scenes step by step."
+
+[SHOW: Terminal output showing the ingestion logs]
+
+"Step 1 — Text Extraction: We support three file formats — PDF (using
+PyPDFLoader), DOCX (using Docx2txtLoader), and plain TXT (using
+TextLoader). The file is temporarily saved, loaded, and the temp file
+is cleaned up."
+
+"Step 2 — Text Cleaning: The extracted text goes through a cleaning
+function that removes newlines, tabs, carriage returns, and collapses
+multiple spaces into one. This is important because raw PDFs often have
+weird line breaks that would fragment our chunks."
+
+[CODE REFERENCE: controllers/ingestion.py — lines 20-25 (clean_text)]
+
+"Step 3 — Recursive Splitting: We use LangChain's
+RecursiveCharacterTextSplitter with these parameters:
+
+  - CHUNK_SIZE = 1250 characters maximum per chunk
+  - CHUNK_OVERLAP = 200 characters overlap between consecutive chunks
+  - That's 16% overlap, within the industry standard of 10-20%
+
+The key innovation is the SEPARATOR HIERARCHY. The splitter doesn't just
+cut at character positions. It tries separators in this order:
+
+  1. '\\n\\n' — paragraph breaks (best semantic boundary)
+  2. '\\n'   — line breaks
+  3. '. '    — sentence endings
+  4. '? '    — question marks
+  5. '! '    — exclamation marks
+  6. '; '    — semicolons (clause boundaries)
+  7. ', '    — commas
+  8. ' '     — individual words
+  9. ''      — character boundary (last resort)
+
+This means the splitter first tries to keep whole paragraphs together.
+If a paragraph is too long, it splits at sentences. Only as a last resort
+does it break mid-word. This preserves semantic coherence far better than
+fixed-position splitting."
+
+[CODE REFERENCE: controllers/ingestion.py — lines 11-17]
+
+"Step 4 — Minimum Size Enforcement: After splitting, we enforce a
+MINIMUM chunk size of 500 characters. Any chunk smaller than 500 gets
+merged with its neighbour.
+
+The algorithm works like this:
+  1. Start with the first chunk as a 'buffer'
+  2. For each subsequent chunk: if the buffer is under 500 chars,
+     merge the next chunk into the buffer
+  3. After the loop, if the trailing buffer is still under 500 chars,
+     merge it backward with the last accepted chunk
+
+This prevents tiny fragments like '(see Table 3)' from becoming their
+own chunks — they'd produce poor embeddings and waste retrieval slots."
+
+[CODE REFERENCE: controllers/ingestion.py — lines 28-66]
+
+"Step 5 — Batched Upload: The final chunks are uploaded to Pinecone in
+batches of 50 to avoid overwhelming the Ollama embedding model. Each
+chunk gets embedded by mxbai-embed-large into a 1024-dimensional vector."
+
+[SHOW: Terminal output showing:
+"Chunk stats: X chunks | min=XXX, max=XXX, avg=XXX chars"]
+
+"As you can see, every chunk is between 500 and 1250 characters. The
+system logged the exact statistics — minimum size, maximum size, and
+average. If any tiny chunks were merged, that's logged too."
+
+================================================================================
+[7:00 - 10:00]  FEATURE 2 — Add Chunks Endpoint
+================================================================================
+
+[SHOW: Swagger UI at localhost:8000/docs → POST /api/v1/add-chunks]
+
+SPEAK:
+"Once your initial documents are ingested, you often need to add new
+knowledge incrementally — without re-ingesting everything. That's what
+the Add Chunks endpoint is for."
+
+[ACTION: In Swagger, call POST /api/v1/add-chunks with this body:]
+{
+  "text": "Binary search is a search algorithm that finds the position of a target value within a sorted array. It compares the target value to the middle element. Binary search runs in O(log n) time complexity, making it much faster than linear search for large datasets. The algorithm was first described by John Mauchly in 1946.",
+  "source": "manual_addition",
+  "ingest": true,
+  "namespace": null
+}
+
+[SHOW: The response showing chunk stats]
+
+"The endpoint does 4 things:
+1. Takes raw text and a source label
+2. Chunks it using the EXACT SAME RecursiveCharacterTextSplitter with
+   the same parameters — 1250 max, 200 overlap, 500 min. This is
+   important: the add_chunks module imports CHUNK_SIZE, CHUNK_OVERLAP,
+   MIN_CHUNK_SIZE, and SEPARATORS directly from controllers/ingestion.py.
+   There's a single source of truth for chunking parameters.
+3. When 'ingest' is true, it immediately embeds and uploads to Pinecone
+4. Returns the strategy used ('recursive'), chunk count, size range,
+   and a 300-character preview of each chunk
+
+You can also set 'ingest' to false to just preview how the text would
+be chunked without actually uploading anything — useful for testing."
+
+[CODE REFERENCE: add_chunks/pipeline.py, api/routes.py lines 46-76]
+
+"Now I'll hand over to [Member 2] who will show you how the system
+handles queries intelligently."
+
+
+################################################################################
+##                                                                            ##
+##  MEMBER 2 — RETRIEVAL GATE + DYNAMIC K SELECTION                           ##
+##  Time: 10:00 - 20:00 (10 minutes)                                         ##
+##                                                                            ##
+################################################################################
+
+================================================================================
+[10:00 - 14:30]  FEATURE 3 — Retrieval Gate for Generic Queries
+================================================================================
+
+[SHOW: Dashboard → "Ask Query" page]
+
+SPEAK:
+"Thanks [Member 1]. Now that we have documents ingested, let's look at
+how the system handles queries. The first thing that happens when a query
+comes in is NOT retrieval — it's the Retrieval Gate.
+
+The gate decides WHETHER a query even needs document retrieval. Think
+about it: if someone types 'hello' or 'thanks', there's no point
+searching Pinecone. That wastes time, costs money on API calls, and
+the irrelevant chunks would actually HURT the LLM's response."
+
+[ACTION: Type "hello" and execute]
+
+"Watch what happens when I type 'hello'."
+
+[SHOW: The response — notice "gate: direct", empty retrieved_contexts]
+
+"See the response? The 'gate' field says 'direct', the retrieved_contexts
+is empty, and the scores list is empty. The system detected this is a
+greeting and answered directly from the LLM without touching Pinecone.
+
+The response says something like 'Hello! What would you like to know
+about your documents?' — it's not a generic chatbot response. The system
+prompt specifically tells the LLM to always guide users toward document
+Q&A. It never suggests music, alarms, or browsing."
+
+[ACTION: Type "thanks" and execute]
+
+"Same thing for 'thanks' — direct answer, no retrieval."
+
+[ACTION: Type "ok" and execute]
+
+"And 'ok' — the gate catches these short non-question inputs too."
+
+SPEAK:
+"The gate works in two tiers:
+
+TIER 1 — Fast Pattern Matching (no LLM call):
+  The system has a hardcoded list of 17 known conversational patterns:
+  'hi', 'hello', 'hey', 'thanks', 'thank you', 'bye', 'goodbye',
+  'good morning', 'good evening', 'good night', 'how are you',
+  'what's up', 'ok', 'okay', 'yes', 'no', 'sure', 'please'.
+
+  It also catches very short queries — 2 words or fewer that don't
+  contain question words like 'what', 'how', 'why', 'when', 'where',
+  'who', 'which', 'explain', 'describe', 'define'.
+
+  This tier is essentially free — just string matching, no LLM call."
+
+[CODE REFERENCE: organiser/retrieval_gate.py — lines 13-55]
+
+"TIER 2 — LLM Classification (for ambiguous cases):
+  If Tier 1 doesn't catch it, the gate asks the LLM itself to classify
+  the query. It sends this prompt:
+
+  'Classify this query. Reply with ONLY the word RETRIEVE or DIRECT.
+   RETRIEVE: query asks about specific facts, documents, data, or
+             domain knowledge.
+   DIRECT: query is a greeting, chitchat, math, or general knowledge.'
+
+  The response is uppercased and checked for 'DIRECT'. If it says
+  DIRECT, the gate routes directly. If it says RETRIEVE or anything
+  else, it goes to retrieval."
+
+[CODE REFERENCE: organiser/retrieval_gate.py — lines 57-84]
+
+"SAFETY-FIRST DESIGN:
+  If anything goes wrong — the import fails, the LLM times out, the
+  response is unparseable — the gate ALWAYS defaults to RETRIEVE. We
+  never accidentally block a real knowledge question.
+
+  Even in controllers/retrieval.py, if the gate module itself fails to
+  import, there's a fallback dict with needs_retrieval=True."
+
+[ACTION: Type "What is binary search?" and execute]
+
+"And for a real knowledge question — the gate correctly routes it to
+the full retrieval pipeline. You can see retrieved_contexts is populated,
+scores are showing, and the answer comes from the documents."
+
+[CODE REFERENCE: organiser/retrieval_gate.py — lines 86-92,
+controllers/retrieval.py — lines 70-83]
+
+================================================================================
+[14:30 - 20:00]  FEATURE 4 — Dynamic K Chunks during Retrieval
+================================================================================
+
+[SHOW: Dashboard → "Ask Query" page]
+
+SPEAK:
+"Now let's talk about HOW MANY chunks we retrieve. In a traditional RAG
+system, you always retrieve a fixed number — typically top 5 or top 10.
+But this is wasteful and sometimes harmful:
+
+  - A simple question like 'Who invented the telephone?' might only need
+    2 highly relevant chunks. Retrieving 5 means 3 are noise.
+  - A complex question like 'Compare the economic policies of the US and
+    China' might need 8-10 chunks spanning multiple topics.
+
+Our system uses Dynamic K Selection — it picks the optimal K for each
+query. Let me show you the 3-stage algorithm."
+
+[SHOW: Code or diagram of the 3-stage algorithm]
+
+"STAGE 1 — Query Complexity Analysis:
+  First, we classify the query into one of three categories. The
+  classifier uses EMBEDDING-BASED SIMILARITY — not keywords.
+
+  It works like this:
+  1. We have 30 pre-written prototype questions — 10 per category:
+     - short_factual: 'What year?', 'Who invented?', 'Name the capital'
+     - complex: 'Explain how...', 'Describe the process...', 'Why did...'
+     - cross_section: 'Compare X and Y', 'How do these differ?'
+
+  2. All 30 prototypes are embedded once (lazily on first call, then
+     cached in memory).
+
+  3. When a query comes in, we embed it and compute the MEAN cosine
+     similarity to each category's 10 prototypes.
+
+  4. The category with the highest mean similarity wins.
+
+  There's also a keyword-based fallback if the embedding model is
+  unavailable — it checks for words like 'who', 'what', 'compare',
+  'explain' and the query's word count.
+
+  Each category maps to K bounds:
+    - short_factual: K range 2-4
+    - complex: K range 5-8
+    - cross_section: K range 6-10"
+
+[CODE REFERENCE: controllers/metrics.py — lines 251-392
+(prototype definitions + classifier)]
+
+[ACTION: Type "Who invented binary search?" and execute]
+
+"For this short factual question, the classifier identifies it as
+'short_factual' — K range 2-4."
+
+"STAGE 2 — Score Threshold Pruning:
+  After retrieving the maximum K chunks, we prune any chunk scoring
+  below 0.25 (the SCORE_NOISE_FLOOR). These are pure noise — the
+  embedding isn't even in the right neighbourhood.
+
+  If this pruning drops us below k_min, we keep at least k_min chunks."
+
+"STAGE 3 — Score Cliff Detection:
+  We look at the scores in descending order and find NATURAL DROP-OFFS.
+  If the gap between any two consecutive chunks exceeds 0.12 (the
+  SCORE_CLIFF_THRESHOLD), we cut there.
+
+  Example: scores are [0.82, 0.78, 0.75, 0.45, 0.38]
+  - Gap between 0.75 and 0.45 is 0.30 — that's way above 0.12
+  - So we cut after position 3, keeping only 3 chunks
+
+  The final K is clamped to the category's [k_min, k_max] bounds."
+
+[CODE REFERENCE: repair/orchestrator.py — lines 46-99]
+
+[ACTION: Type "Compare bubble sort and merge sort, explain their
+time complexities and when to use each one"]
+
+"For this cross-section query, watch — the system retrieves more chunks
+because the classifier detected comparison keywords AND the query is
+long enough to be classified as cross-section, giving it a K range of
+6-10."
+
+[SHOW: Compare the number of retrieved chunks between the two queries]
+
+"IMPORTANT: Dynamic K starts in the REPAIR pipeline. By default, the
+main query pipeline uses K=5. But when Strategy 1 (dynamic K) in the
+repair cascade accumulates 5 or more successes, it gets PROMOTED to the
+main pipeline. After that, EVERY query uses dynamic K — not just repair
+probes. My teammate [Member 4] will explain this promotion mechanism.
+
+Now I'll hand over to [Member 3] who will explain what happens AFTER
+the answer is generated — how the system detects bad answers."
+
+
+################################################################################
+##                                                                            ##
+##  MEMBER 3 — 5-RULE DETECTION SYSTEM                                        ##
+##  Time: 20:00 - 30:00 (10 minutes)                                         ##
+##                                                                            ##
+################################################################################
+
+================================================================================
+[20:00 - 22:00]  THE DETECTION PHILOSOPHY
+================================================================================
+
+[SHOW: Dashboard → Query Diagnostics page]
+
+SPEAK:
+"Thanks [Member 2]. So far we've seen how documents get ingested and how
+queries are processed. But here's the key question: how does the system
+know when something went WRONG?
+
+In a traditional RAG system, the answer is: it doesn't. You ask a
+question, get an answer, and have no idea if the answer is good or bad
+unless a human checks it.
+
+Our system runs 5 independent detection rules AUTOMATICALLY after every
+single query. These rules run on a BACKGROUND THREAD so the user gets
+their answer instantly — they don't wait for detection to complete.
+
+The detection system is SILENT on success — it only creates a
+LowRecallEvent in the database when one or more rules trigger. Let me
+walk through each rule."
+
+================================================================================
+[22:00 - 28:00]  THE 5 DETECTION RULES
+================================================================================
+
+[SHOW: Code or diagram showing the 5 rules]
+
+SPEAK:
+"RULE 1 — low_top_score (Score-based, no LLM call):
+  Checks if the TOP-1 retrieval score is below 0.65.
+
+  Why 0.65? Our embedding model is mxbai-embed-large, which produces
+  similarity scores in the 0.55–0.85 range. A typical 'good match' is
+  0.70+. If even the BEST chunk scores below 0.65, the retrieval
+  completely failed to find relevant content.
+
+  This is the simplest and cheapest check — just compare a number."
+
+[CODE REFERENCE: detector/detectors.py — line 22, lines 159-161]
+
+"RULE 2 — score_drop (Score-based, no LLM call):
+  Looks at the MAXIMUM GAP between any two adjacent retrieval scores.
+  If that gap exceeds 0.15, there's a retrieval cliff.
+
+  Example: scores [0.80, 0.78, 0.42, 0.38]
+  The gap between 0.78 and 0.42 is 0.36 — way above 0.15.
+  This means we retrieved some relevant chunks AND some completely
+  irrelevant ones. The noise chunks will confuse the LLM.
+
+  Note: we use MAX ADJACENT GAP, not rank-1 minus rank-K. The latter
+  scales with K — when dynamic K is promoted, K=2 gives a smaller
+  spread than K=10, making the rule's sensitivity drift. Max adjacent
+  gap is K-invariant."
+
+[CODE REFERENCE: detector/detectors.py — line 23, lines 167-170]
+
+"RULE 3 — llm_uncertainty (Text pattern, no LLM call):
+  Scans the LLM's response for HEDGING LANGUAGE. We have a list of
+  50+ uncertainty phrases including:
+
+  Direct uncertainty: 'i don't know', 'i'm not sure', 'cannot find',
+  'no information', 'unable to find'
+
+  Refusal patterns: 'does not provide', 'does not contain', 'does not
+  mention', 'not mentioned', 'not specified', 'no specific', 'no
+  evidence', 'cannot determine', 'not found in'
+
+  Document refusals: 'the text does not', 'the context does not',
+  'the passage does not', 'based on the provided'
+
+  If ANY of these phrases appear in the lowercased response, the rule
+  fires. The logic is: if the chunk contains the answer, the LLM just
+  states it directly. Any hedging = the answer isn't in the chunks."
+
+[CODE REFERENCE: detector/detectors.py — lines 34-52, lines 172-174]
+
+"RULE 4 — semantic_mismatch (Embedding-based, costs 1 Ollama call):
+  This rule checks if the retrieved chunks are SEMANTICALLY COHERENT
+  with each other. It works like this:
+
+  1. Embed all retrieved chunks (batched in a single Ollama call)
+  2. Compute ALL pairwise cosine similarities between chunks
+  3. Calculate the mean pairwise similarity
+  4. Compare against a RELATIVE threshold: 0.65 × top1_score
+
+  Why relative instead of absolute? Cross-section queries naturally
+  pull chunks from different sub-topics within one document — like
+  stadium, game, and players paragraphs from a Wikipedia article. Their
+  mean pairwise sim sits ~0.55–0.65, which would trip any absolute
+  threshold above ~0.55.
+
+  By tying the bar to top1_score, we expect coherence proportional to
+  retrieval quality: high top1 → expect tight chunks; modest top1 →
+  tolerate more spread.
+
+  The rule skips when top1 ≤ 0 (no retrieval) — Rule 1 owns that case."
+
+[CODE REFERENCE: detector/detectors.py — lines 24, 69-102]
+
+"RULE 5 — evidence_mismatch (Embedding-based, costs 1 Ollama call):
+  This is our hallucination detector. It checks whether the LLM's
+  answer is GROUNDED in any retrieved chunk.
+
+  1. Embed the answer and each chunk in a single batched call
+  2. Compute the answer's cosine similarity to EACH chunk individually
+  3. Take the MAXIMUM similarity (best-matching chunk)
+  4. If the max is below 0.60, the answer isn't backed by anything
+
+  Why per-chunk and not concatenated? A short factual answer like
+  '$5,000,000' embeds far from a long concatenated context blob purely
+  due to length asymmetry. The old 'embed all chunks together' version
+  flagged correct answers reflexively. 'Grounded in SOME chunk' is what
+  we actually mean."
+
+[CODE REFERENCE: detector/detectors.py — lines 32, 105-135]
+
+================================================================================
+[28:00 - 30:00]  SEVERITY & FLAGGING
+================================================================================
+
+[SHOW: Dashboard → "Flagged Events" page with real events]
+
+SPEAK:
+"When one or more rules trigger, the system creates a LowRecallEvent
+in the database. The severity depends on HOW MANY detectors fired:
+
+  - 1 detector  = LOW severity
+  - 2 detectors = MEDIUM severity
+  - 3 or more   = HIGH severity
+
+Each event records:
+  - query_log_id: links back to the original query
+  - triggered_detectors: JSON list like ['low_top_score', 'llm_uncertainty']
+  - severity: LOW / MEDIUM / HIGH
+  - resolved: starts as False
+  - unfixable: starts as False (set to True if all repair strategies fail)
+
+The QueryLog row also gets its 'flagged' column set to True so the
+dashboard can show which queries had problems."
+
+[SHOW: Dashboard events with different severities and detector combinations]
+
+"Here you can see real flagged events. Notice this one has severity
+MEDIUM with detectors ['low_top_score', 'score_drop'] — the retrieval
+score was low AND there was a big quality cliff.
+
+And this one has severity HIGH with three detectors — that's a query
+where almost everything went wrong.
+
+These events are what drives the repair system. My teammate [Member 4]
+will now show you how the system actually FIXES these problems."
+
+
+################################################################################
+##                                                                            ##
+##  MEMBER 4 — REPAIR CASCADE + AUTO-WORKER DAEMON                            ##
+##  Time: 30:00 - 40:00 (10 minutes)                                         ##
+##                                                                            ##
+################################################################################
+
+================================================================================
+[30:00 - 32:30]  THE AUTO-WORKER DAEMON
+================================================================================
+
+[SHOW: Terminal running auto_worker.py]
+
+SPEAK:
+"Thanks [Member 3]. So we know the system can DETECT bad answers. But
+detection alone is useless if nothing acts on it. That's where the
+auto-worker daemon and the repair cascade come in.
+
+The auto_worker.py runs as a SEPARATE PROCESS alongside the FastAPI
+server. It's a background daemon that continuously monitors the database
+and triggers batch repairs when failures accumulate."
+
+[SHOW: auto_worker.py — highlight the parameters]
+
+"The daemon has three configuration constants:
+
+  PENDING_MIN = 5
+    At least 5 unresolved events must exist before we act.
+
+  PENDING_RATIO = 0.30
+    Those pending events must be at least 30% of total queries.
+
+  POLL_INTERVAL_SECONDS = 5
+    The daemon checks every 5 seconds.
+
+BOTH conditions must be true simultaneously. This prevents two failure
+modes:
+  1. False alarm on small samples: If you've only asked 3 questions and
+     2 failed, that's 67% failure rate but only 2 events. PENDING_MIN
+     prevents acting on too few data points.
+  2. Noise in large datasets: If you've asked 500 questions and 5 failed,
+     that's only 1% — not worth triggering repairs. PENDING_RATIO
+     prevents over-reacting.
+
+When BOTH conditions are met, the daemon processes ALL pending events
+through the repair cascade."
+
+[SHOW: Terminal logs showing the heartbeat:
+"Waiting: X pending events, but threshold not met (count=X/5, ratio=X%/30%)"]
+
+"You can see the daemon's heartbeat here — it's monitoring but the
+threshold isn't met yet."
+
+[CODE REFERENCE: auto_worker.py]
+
+================================================================================
+[32:30 - 35:30]  THE 4-STRATEGY REPAIR CASCADE
+================================================================================
+
+[SHOW: repair/cascade.py — strategy overview]
+
+SPEAK:
+"When repair is triggered, each event goes through a 4-STRATEGY ORDERED
+CASCADE. The strategies are tried in order S1 → S2 → S3 → S4. The FIRST
+strategy that resolves the issue wins, and the cascade stops.
+
+If all four fail, the event is marked UNFIXABLE."
+
+[SHOW: Strategy diagram or table]
+
+"STRATEGY 1 — Dynamic K Selection (s1_dynamic_k):
+  Varies the retrieval K based on question category WITHOUT touching
+  Pinecone. This is a READ-ONLY experiment.
+
+  It classifies the query, picks a dynamic K from the category bounds,
+  and re-probes. If retrieving a different number of chunks alone
+  produces a better answer — we're done.
+
+  This is the cheapest strategy — no Pinecone writes, no rechunking."
+
+"STRATEGY 2 — Chunk Size Variation (s2_chunk_size):
+  The decision engine DIAGNOSES the root cause and recommends a new
+  chunk configuration. K is FIXED at 5 for fair comparison.
+
+  The diagnosis analyzes:
+    - Which detectors fired
+    - The query's question category
+    - Stage 2 metrics (precision, sufficiency, hallucination rate)
+    - Retrieval scores
+
+  Based on the diagnosis, it recommends one of 5 chunk configs:
+
+  ┌────────────────────────┬────────────┬─────────┬───────────┐
+  │ Root Cause             │ Chunk Size │ Overlap │ Algorithm │
+  ├────────────────────────┼────────────┼─────────┼───────────┤
+  │ High hallucination     │    200     │   40    │    llm    │
+  │ Low precision (factual)│    350     │   70    │ semantic  │
+  │ Insufficient context   │   1400     │  250    │ semantic  │
+  │ Cross-section failure  │   1700     │  300    │  entropy  │
+  │ Stale content          │  (keep)    │ (keep)  │ semantic  │
+  └────────────────────────┴────────────┴─────────┴───────────┘
+
+  Three different RECHUNKING ALGORITHMS are available:
+    - semantic: RecursiveCharacterTextSplitter (configurable size/overlap)
+    - llm: Asks the LLM to identify topic boundary sentences
+    - entropy: Splits at sentences with high vocabulary novelty (>60% new
+      words = topic shift)"
+
+[CODE REFERENCE: detector/decision_engine.py (diagnosis),
+repair/chunker.py (rechunking algorithms)]
+
+"STRATEGY 3 — Combined (s3_combined):
+  Uses BOTH dynamic K AND rechunking together. Sometimes the problem
+  needs both a different K and different chunk sizes.
+
+STRATEGY 4 — Alternate LLM (s4_alt_llm):
+  Same chunks, no Pinecone changes. Swaps mistral for gemma3:27b —
+  a larger, more capable model.
+
+  S4 has a DIFFERENT win condition: it doesn't use _is_improved()
+  (since the retrieval scores are unchanged). Instead, S4 wins if
+  the fallback LLM produces a SUBSTANTIVE answer — meaning it's not
+  a refusal like 'I don't know' or 'The text does not mention this'.
+
+  This handles cases where the chunks DO contain the answer but the
+  smaller model can't extract it."
+
+[CODE REFERENCE: repair/cascade.py — strategies at lines 160-396]
+
+================================================================================
+[35:30 - 38:00]  SNAPSHOT, ROLLBACK & PROVENANCE
+================================================================================
+
+[SHOW: repair/reembedder.py or terminal repair logs]
+
+SPEAK:
+"Strategies S2 and S3 modify Pinecone — they delete old chunks and insert
+new ones. This is DANGEROUS. If the repair makes things worse, we could
+permanently damage the knowledge base.
+
+That's why we have a SNAPSHOT + ROLLBACK system:"
+
+"Step 1 — SNAPSHOT: Before deleting any chunks, the reembedder saves a
+  complete copy to the ChunkSnapshot table in SQLite. This includes:
+    - The Pinecone vector ID
+    - The original chunk text
+    - The full metadata as JSON
+    - The namespace
+
+  This is our insurance policy — we can always restore the original
+  state."
+
+"Step 2 — RECHUNK: The old chunks are deleted from Pinecone. The text is
+  rechunked with the new strategy and parameters. The new chunks are
+  embedded and inserted into Pinecone."
+
+"Step 3 — PROBE: We re-run the ORIGINAL query and measure metrics at the
+  SAME K value. This gives us an apples-to-apples comparison."
+
+"Step 4 — JUDGE: The _is_improved() function checks:
+  - Did the top-1 score improve? (by at least 0.001)
+  - Did precision, recall, or accuracy improve? (by at least 0.01)
+  - Did any metric DEGRADE significantly? (>0.1 drop = reject)
+  - Is the new answer a REAL answer? (not a refusal/hedging)
+
+  CRITICAL: Even if scores improved, if the answer is still 'I don't
+  know' — the repair is REJECTED. A better score that still produces a
+  non-answer is not a real improvement."
+
+"Step 5 — COMMIT or ROLLBACK:
+  If improved → keep the new chunks, mark the event as resolved.
+  If not improved → ROLLBACK:
+    1. Delete the new chunks from Pinecone
+    2. Load the snapshot entries from SQLite
+    3. Re-embed each original chunk with the current model
+    4. Upsert them back to Pinecone with the original vector IDs
+    5. Clean up the snapshot entries
+
+  Old data is NEVER permanently lost."
+
+[CODE REFERENCE: repair/reembedder.py (snapshot + rollback),
+repair/orchestrator.py — lines 251-293 (_is_improved)]
+
+"PROVENANCE: Every cascade run writes two records:
+  1. RepairReport: strategy used, scores before/after, chunks before/after,
+     precision/recall/accuracy changes, dynamic K used, original and
+     resolved answers, duration
+  2. AdaptationLog: full audit trail — what was observed, what was
+     diagnosed, what strategy was selected, what config was before/after,
+     what metrics were before/after, the outcome, whether it was
+     rolled back"
+
+================================================================================
+[38:00 - 40:00]  STRATEGY PROMOTION
+================================================================================
+
+[SHOW: Dashboard → Strategy Counters or Runtime Flags]
+
+SPEAK:
+"There's one more clever mechanism — Strategy Promotion.
+
+Every time a strategy resolves an event, its success counter is
+incremented in the StrategyCounter table. When Strategy 1 (dynamic K)
+accumulates 5 or more successes, it gets PROMOTED to the main query
+pipeline.
+
+This means the system LEARNS: if dynamically selecting K keeps fixing
+problems, it should be the DEFAULT behaviour, not just a repair trick.
+
+After promotion:
+  - The RuntimeFlag 'dynamic_k_promoted' is set to True in the database
+  - controllers/retrieval.py checks this flag on EVERY query
+  - If promoted, it calls _dynamic_k_selection() instead of using K=5
+  - Strategy 1 is SKIPPED in future cascade runs (it's already active)
+
+This is a ONE-WAY promotion — once dynamic K is in the main pipeline,
+it stays there."
+
+[CODE REFERENCE: repair/cascade.py — lines 49, 119-136 (promotion)]
+
+"Now [Member 5] will show you the remaining components — the auto-indexer,
+evaluation pipeline, and wrap everything up."
+
+
+################################################################################
+##                                                                            ##
+##  MEMBER 5 — AUTO-INDEXER + EVALUATION + CONCLUSION                         ##
+##  Time: 40:00 - 50:00 (10 minutes)                                         ##
+##                                                                            ##
+################################################################################
+
+================================================================================
+[40:00 - 43:00]  FEATURE 5 — Auto-Indexer (Stale Embedding Detection)
+================================================================================
+
+[SHOW: Swagger UI → GET /api/v1/index/health]
+
+SPEAK:
+"Thanks [Member 4]. So far we've covered the full ingestion → query →
+detect → repair loop. But there's another problem RAG systems face
+over time: EMBEDDING DRIFT.
+
+If you update your embedding model, or if the model's weights shift
+between versions, the stored embeddings in Pinecone become STALE — they
+no longer accurately represent the text. The auto-indexer detects and
+fixes this."
+
+[ACTION: Call GET /api/v1/index/health in Swagger]
+
+"The health endpoint runs a CONSISTENCY CHECK:
+  - Total vector count in the namespace
+  - Embedding dimension verification
+  - Metadata integrity — what percentage of vectors have text metadata.
+    It samples ~100 vectors using diverse probe queries and checks each.
+  - Empty text detection — vectors with missing content
+  - Score distribution — average retrieval score on a generic query
+  - Overall health status: HEALTHY (integrity >90%), DEGRADED, or EMPTY"
+
+[SHOW: The health report response]
+
+[ACTION: Call GET /api/v1/index/staleness?sample_size=30]
+
+"The staleness detector works like this:
+  1. SAMPLE: Use diverse probe queries ('algorithm', 'data structure',
+     'network', etc.) to fetch random vectors from Pinecone. We need
+     the stored embeddings AND the text metadata.
+  2. RE-EMBED: For each sampled vector, re-embed the text using the
+     current mxbai-embed-large model.
+  3. COMPARE: Compute cosine similarity between stored vs fresh embedding.
+  4. FLAG: If similarity < 0.95 (drift_threshold), the chunk is stale.
+
+The report shows: total sampled, stale count, stale IDs, average drift,
+and worst drift."
+
+[SHOW: Staleness report]
+
+[ACTION: Call POST /api/v1/index/refresh]
+
+"The full refresh pipeline runs everything end-to-end:
+  1. Consistency check (before)
+  2. Staleness detection
+  3. Auto re-embedding of stale chunks via Pinecone UPSERT (in-place
+     update — no delete needed)
+  4. Consistency check (after)
+
+No chunks are ever deleted during auto-indexing. Stale vectors are
+updated in-place, preserving their IDs and metadata."
+
+[CODE REFERENCE: auto_indexer/engine.py]
+
+================================================================================
+[43:00 - 46:00]  FEATURE 6 — Evaluation Pipeline & Ground-Truth Enrichment
+================================================================================
+
+[SHOW: Swagger UI → POST /api/v1/evaluate-local]
+
+SPEAK:
+"To systematically measure the pipeline's quality, we have a batch
+evaluation endpoint. You upload a JSON file with test questions and
+ground-truth answers."
+
+[ACTION: Show the expected JSON format]
+Format: [{"qun": "What is binary search?", "ans": ["Binary search is..."]}]
+
+"The evaluation runs the full RAG pipeline on each question and computes
+7 METRICS per question:
+
+STAGE 1 — Traditional Metrics (4):
+  1. ROUGE-L: Longest common subsequence F1 between generated answer
+     and ground truth. Measures word-level overlap.
+  2. Semantic Similarity: Embedding cosine similarity between answer
+     and GT. Captures meaning even with different wording.
+  3. Context-Question Similarity: Mean cosine sim between retrieved
+     chunks and the question. Are the chunks relevant to what was asked?
+  4. Context-GT Similarity: Mean cosine sim between chunks and GT.
+     Do the chunks contain the actual answer?
+
+STAGE 2 — Self-Healing Metrics (3):
+  5. Retrieval Precision@K: What fraction of retrieved chunks are
+     relevant? A chunk is 'relevant' if its similarity to any ground
+     truth ≥ 0.50.
+  6. Context Sufficiency: Boolean — can the combined context fully
+     answer the question? (combined context ↔ GT similarity ≥ 0.70)
+  7. Hallucination Rate: What fraction of answer claims are NOT grounded
+     in the retrieved context? Each sentence is checked against each
+     chunk. If the best match < 0.55, that claim is ungrounded.
+
+All Stage 2 metrics are EMBEDDING-BASED — no extra LLM calls needed.
+Results are saved to a CSV file AND persisted to the EvalSnapshot table
+in the dashboard database."
+
+[CODE REFERENCE: controllers/evaluation.py, controllers/metrics.py]
+
+[SHOW: Dashboard → Evaluation History showing trend charts]
+
+"The dashboard shows these metrics over time, so you can see if the
+pipeline is improving or degrading after repairs."
+
+SPEAK:
+"There's also a REAL-TIME enrichment feature. When a user asks a question
+that matches our ground-truth dataset (dataset/long_ans.json), the
+system automatically enriches that query log with GT-backed metrics —
+the same 7 metrics the batch evaluation computes, but computed live on
+a background thread.
+
+The gt_lookup module loads the dataset on first access, normalizes
+questions (lowercase, collapsed whitespace, stripped punctuation), and
+looks up by exact match. When a match is found, it computes precision,
+sufficiency, hallucination, and similarity against the known answers.
+
+This enrichment is what makes the repair cascade's comparison much
+sharper — when ground truths are available, _is_improved() checks
+precision, recall, AND accuracy instead of just the top-1 score."
+
+[CODE REFERENCE: controllers/gt_lookup.py]
+
+================================================================================
+[46:00 - 50:00]  CONCLUSION — The Self-Organising Loop
+================================================================================
+
+[SHOW: Dashboard Overview page with updated stats]
+
+SPEAK:
+"Let me bring everything together. Here's the complete self-organising
+loop that our system implements:
+
+ 1. INGEST — Documents are chunked with variable sizes (500-1250 chars),
+    using a semantic separator hierarchy and minimum-size enforcement.
+
+ 2. GATE — Each query passes through a 2-tier retrieval gate that
+    filters greetings and chitchat, saving unnecessary vector searches.
+
+ 3. RETRIEVE — For real questions, the pipeline retrieves top-K chunks.
+    After Strategy 1 promotion, Dynamic K selects the optimal K based
+    on query complexity and score patterns.
+
+ 4. ANSWER — A single LLM call generates the answer using only the
+    retrieved context, with a strict factual-only prompt.
+
+ 5. DETECT — On a background thread, 5 detection rules check for low
+    retrieval score, score drops, LLM uncertainty, semantic mismatch,
+    and evidence mismatch.
+
+ 6. ENRICH — If the query matches ground-truth data, precision,
+    sufficiency, and hallucination metrics are computed and stored.
+
+ 7. MONITOR — The auto_worker daemon polls every 5 seconds. When ≥5
+    pending events AND ≥30% of total queries are flagged, batch repair
+    kicks in.
+
+ 8. REPAIR — The 4-strategy cascade tries Dynamic K → Chunk Size →
+    Combined → Alt LLM. Each attempt is probed, judged, and either
+    committed or rolled back with full provenance.
+
+ 9. PROMOTE — When Dynamic K accumulates 5 successes, it's promoted
+    to the main pipeline — the system LEARNS from its repairs.
+
+10. INDEX — The auto-indexer detects and refreshes stale embeddings
+    via in-place upsert, maintaining index health over time.
+
+11. EXPAND — New knowledge can be added anytime through the add-chunks
+    endpoint without re-ingesting existing documents.
+
+The result is a RAG system that doesn't just retrieve and generate —
+it monitors, detects, diagnoses, heals, learns, and organises itself.
+
+Thank you."
+
+================================================================================
+                         END OF DEMO SCRIPT
+================================================================================
+
+COMPLETE API ENDPOINT REFERENCE (19 endpoints):
+  ── Core RAG ──
+  POST /api/v1/ingest              → Upload and chunk a document (PDF/DOCX/TXT)
+  POST /api/v1/query               → Ask a question (full RAG pipeline with gating)
+  POST /api/v1/add-chunks          → Add raw text as new chunks (with optional ingest)
+  POST /api/v1/evaluate            → Single question evaluation (question + GT)
+  POST /api/v1/evaluate-local      → Batch evaluation from JSON dataset upload
+
+  ── Monitoring & Logs ──
+  GET  /api/v1/logs                → View recent query logs (scores, latency, flags)
+  GET  /api/v1/events              → View flagged LowRecallEvents (with filter)
+
+  ── Repair & Self-Healing ──
+  POST /api/v1/repair/{event_id}   → Manually trigger repair cascade for an event
+  GET  /api/v1/repair-report/{event_id} → View repair report + diagnosis for an event
+  GET  /api/v1/adaptation-log      → Full provenance trail of all adaptation cycles
+  GET  /api/v1/strategy-counters   → Success counts per cascade strategy
+  GET  /api/v1/runtime-flags       → Runtime flags (e.g., dynamic_k_promoted)
+
+  ── Pipeline Configuration ──
+  GET  /api/v1/pipeline-config     → Current active chunk configuration
+  POST /api/v1/pipeline-config     → Manually override chunk config (testing)
+
+  ── Auto-Indexer ──
+  GET  /api/v1/index/health        → Run consistency checks on Pinecone index
+  GET  /api/v1/index/staleness     → Detect stale/drifted embeddings
+  POST /api/v1/index/refresh       → Full auto-indexer pipeline (detect → fix → verify)
+
+  ── Evaluation History ──
+  GET  /api/v1/eval-history        → View evaluation snapshots for dashboard
+
+TIMING SUMMARY (50 minutes, 5 members × 10 minutes each):
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ MEMBER 1 (0:00 - 10:00)                                            │
+  │   0:00 - 3:00   Introduction + Architecture Overview               │
+  │   3:00 - 7:00   Feature 1: Variable Chunk Size Ingestion           │
+  │   7:00 - 10:00  Feature 2: Add Chunks Endpoint                     │
+  ├──────────────────────────────────────────────────────────────────────┤
+  │ MEMBER 2 (10:00 - 20:00)                                           │
+  │   10:00 - 14:30  Feature 3: Retrieval Gate (2-tier gating)         │
+  │   14:30 - 20:00  Feature 4: Dynamic K Selection (3-stage algo)     │
+  ├──────────────────────────────────────────────────────────────────────┤
+  │ MEMBER 3 (20:00 - 30:00)                                           │
+  │   20:00 - 22:00  Detection Philosophy + Background Threading       │
+  │   22:00 - 28:00  The 5 Detection Rules (detailed walkthrough)      │
+  │   28:00 - 30:00  Severity Levels + Flagging System                 │
+  ├──────────────────────────────────────────────────────────────────────┤
+  │ MEMBER 4 (30:00 - 40:00)                                           │
+  │   30:00 - 32:30  Auto-Worker Daemon (trigger conditions)           │
+  │   32:30 - 35:30  4-Strategy Repair Cascade (S1→S2→S3→S4)          │
+  │   35:30 - 38:00  Snapshot, Rollback & Provenance                   │
+  │   38:00 - 40:00  Strategy Promotion (S1 → main pipeline)           │
+  ├──────────────────────────────────────────────────────────────────────┤
+  │ MEMBER 5 (40:00 - 50:00)                                           │
+  │   40:00 - 43:00  Feature 5: Auto-Indexer (staleness + refresh)     │
+  │   43:00 - 46:00  Feature 6: Evaluation Pipeline + GT Enrichment    │
+  │   46:00 - 50:00  Conclusion — The 11-Step Self-Organising Loop     │
+  └──────────────────────────────────────────────────────────────────────┘
