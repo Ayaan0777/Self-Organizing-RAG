@@ -1,0 +1,317 @@
+================================================================================
+  Self-Organising RAG — Commands Reference
+================================================================================
+
+A cheat-sheet of every command used to set up, run, test, inspect, and reset
+the system. Grouped by purpose. PowerShell syntax (Windows); macOS/Linux
+users can drop the `.exe` from `curl.exe` and the `\\` line continuations.
+
+
+================================================================================
+  1. SETUP (one-time per machine)
+================================================================================
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Ensure Ollama is running with all required models
+ollama serve
+ollama pull mistral                  # Primary LLM (7B)
+ollama pull gemma3:27b               # Fallback LLM for cascade S4
+ollama pull mxbai-embed-large        # Embeddings (1024-dim)
+
+# Verify models are present
+ollama list
+
+# Create .env from the template (then edit with real Pinecone credentials)
+copy env_format.txt .env
+notepad .env   # set PINECONE_API_KEY, PINECONE_INDEX_NAME, PINECONE_NAMESPACE
+
+
+================================================================================
+  2. RUNNING THE SYSTEM (3 processes, 3 terminals)
+================================================================================
+
+# Terminal 1 — FastAPI backend
+uvicorn main:app --reload
+
+# Terminal 2 — Self-healing daemon (cascade trigger)
+python auto_worker.py
+
+# Terminal 3 — Streamlit dashboard
+streamlit run dashboard/app.py
+
+# Dashboard URL : http://localhost:8501
+# API base URL  : http://localhost:8000/api/v1
+# API docs      : http://localhost:8000/docs   (FastAPI auto-generated Swagger)
+
+
+================================================================================
+  3. DOCUMENT INGESTION
+================================================================================
+
+# Upload a PDF / DOCX / TXT
+curl.exe -F "file=@documents/your_doc.pdf" `
+  "http://localhost:8000/api/v1/ingest?namespace=mxbai-embed-large"
+
+# Upload from dashboard:  Ingest Document page → choose file → INGEST DOCUMENT
+
+# Ad-hoc text chunking (no Pinecone upload)
+curl.exe -X POST http://localhost:8000/api/v1/add-chunks `
+  -H "Content-Type: application/json" `
+  -d "{\"text\":\"Your raw text here.\",\"source\":\"manual-paste\",\"ingest\":false}"
+
+# Same, but also upload to Pinecone
+curl.exe -X POST http://localhost:8000/api/v1/add-chunks `
+  -H "Content-Type: application/json" `
+  -d "{\"text\":\"Your raw text here.\",\"source\":\"manual\",\"ingest\":true,\"namespace\":\"mxbai-embed-large\"}"
+
+
+================================================================================
+  4. QUERYING
+================================================================================
+
+# Ask a question
+curl.exe -X POST http://localhost:8000/api/v1/query `
+  -H "Content-Type: application/json" `
+  -d "{\"query\":\"Which NFL team won Super Bowl 50?\",\"namespace\":\"mxbai-embed-large\"}"
+
+# Or use dashboard "Ask Query" page
+
+
+================================================================================
+  5. EVALUATION
+================================================================================
+
+# Single question with ground truth
+curl.exe -X POST http://localhost:8000/api/v1/evaluate `
+  -H "Content-Type: application/json" `
+  -d "{\"question\":\"...\",\"ground_truth\":\"...\"}"
+
+# Batch evaluation against the long_ans.json dataset (first 30 questions)
+curl.exe -F "file=@dataset/long_ans.json" `
+  -F "namespace=mxbai-embed-large" `
+  -F "max_questions=30" `
+  -F "start_index=0" `
+  http://localhost:8000/api/v1/evaluate-local
+
+
+================================================================================
+  6. INSPECTION ENDPOINTS (GETs — read-only)
+================================================================================
+
+# Recent query logs
+curl.exe "http://localhost:8000/api/v1/logs?limit=20"
+
+# LowRecallEvents
+curl.exe "http://localhost:8000/api/v1/events?unresolved_only=true"
+
+# Strategy success counters (S1/S2/S3/S4)
+curl.exe http://localhost:8000/api/v1/strategy-counters
+
+# Promotion / runtime flags
+curl.exe http://localhost:8000/api/v1/runtime-flags
+
+# Full cascade audit trail
+curl.exe "http://localhost:8000/api/v1/adaptation-log?limit=20"
+
+# Repair report for a specific event
+curl.exe http://localhost:8000/api/v1/repair-report/42
+
+# Pinecone index health
+curl.exe "http://localhost:8000/api/v1/index/health?namespace=mxbai-embed-large"
+
+# Embedding drift detection
+curl.exe "http://localhost:8000/api/v1/index/staleness?sample_size=30"
+
+# Auto-indexer full refresh
+curl.exe -X POST `
+  "http://localhost:8000/api/v1/index/refresh?namespace=mxbai-embed-large&sample_size=50&auto_fix=true"
+
+# Pipeline config (current chunking parameters)
+curl.exe http://localhost:8000/api/v1/pipeline-config
+
+# Evaluation history
+curl.exe "http://localhost:8000/api/v1/eval-history?limit=10"
+
+
+================================================================================
+  7. MANUAL REPAIR TRIGGER
+================================================================================
+
+# Force the cascade to run on a specific event right now (bypass the
+# 5+30% threshold). Returns the cascade result inline.
+curl.exe -X POST http://localhost:8000/api/v1/repair/42
+
+
+================================================================================
+  8. DYNAMIC K PROMOTION MANAGEMENT
+================================================================================
+
+# Open the SQLite database (interactive prompt)
+sqlite3 db/autorag.db
+
+# --- Inside sqlite3 prompt ---
+
+# Check current state
+SELECT * FROM autorag_runtime_flags;
+SELECT * FROM autorag_strategy_counters;
+
+# MANUALLY PROMOTE (skip waiting for 5 successes)
+UPDATE autorag_runtime_flags
+SET value = 1, set_at = datetime('now')
+WHERE name = 'dynamic_k_promoted';
+
+# If the row doesn't exist yet, insert it:
+INSERT INTO autorag_runtime_flags (name, value, set_at)
+VALUES ('dynamic_k_promoted', 1, datetime('now'));
+
+# RESET PROMOTION (full reset — flag off + counter to 0)
+UPDATE autorag_runtime_flags
+SET value = 0, set_at = datetime('now')
+WHERE name = 'dynamic_k_promoted';
+
+UPDATE autorag_strategy_counters
+SET success_count = 0
+WHERE strategy = 's1_dynamic_k';
+
+# Quit sqlite
+.quit
+
+# --- One-liner Python alternative (no sqlite3 CLI needed) ---
+
+# Promote:
+python -c "import sqlite3; c = sqlite3.connect('db/autorag.db'); c.execute(\"UPDATE autorag_runtime_flags SET value = 1, set_at = datetime('now') WHERE name = 'dynamic_k_promoted'\"); c.commit(); print(list(c.execute('SELECT * FROM autorag_runtime_flags')))"
+
+# Reset:
+python -c "import sqlite3; c = sqlite3.connect('db/autorag.db'); c.execute(\"UPDATE autorag_runtime_flags SET value = 0 WHERE name = 'dynamic_k_promoted'\"); c.execute(\"UPDATE autorag_strategy_counters SET success_count = 0 WHERE strategy = 's1_dynamic_k'\"); c.commit(); print('reset done')"
+
+# The flag is read per request — no uvicorn restart needed.
+
+
+================================================================================
+  9. RAW SQL — USEFUL INSPECTION QUERIES
+================================================================================
+
+sqlite3 db/autorag.db
+
+# Total queries, flagged, healthy
+SELECT
+  COUNT(*) AS total,
+  SUM(CASE WHEN flagged = 1 THEN 1 ELSE 0 END) AS flagged,
+  SUM(CASE WHEN flagged = 0 THEN 1 ELSE 0 END) AS healthy
+FROM autorag_query_log;
+
+# Event breakdown
+SELECT
+  COUNT(*) AS total,
+  SUM(CASE WHEN resolved = 1 THEN 1 ELSE 0 END) AS resolved,
+  SUM(CASE WHEN unfixable = 1 THEN 1 ELSE 0 END) AS unfixable,
+  SUM(CASE WHEN resolved = 0 AND unfixable = 0 THEN 1 ELSE 0 END) AS pending
+FROM autorag_low_recall_events;
+
+# Strategy success counts (sorted)
+SELECT strategy, success_count, last_incremented_at
+FROM autorag_strategy_counters
+ORDER BY success_count DESC;
+
+# Recent repair reports
+SELECT id, event_id, strategy_used, resolved, score_before, score_after, dynamic_k
+FROM autorag_repair_reports
+ORDER BY timestamp DESC
+LIMIT 10;
+
+# Recent cascade adaptations (cascade_steps is in `observation`)
+SELECT id, event_id, strategy_selected, outcome, rolled_back, created_at
+FROM autorag_adaptation_log
+ORDER BY created_at DESC
+LIMIT 10;
+
+# Chunks awaiting rollback (should normally be empty for resolved events)
+SELECT event_id, COUNT(*) AS chunks
+FROM autorag_chunk_snapshots
+GROUP BY event_id
+ORDER BY chunks DESC;
+
+# Flag rate by hour
+SELECT
+  strftime('%Y-%m-%d %H', timestamp) AS hour,
+  COUNT(*) AS total,
+  SUM(CASE WHEN flagged = 1 THEN 1 ELSE 0 END) AS flagged,
+  ROUND(100.0 * SUM(CASE WHEN flagged = 1 THEN 1 ELSE 0 END) / COUNT(*), 1) AS flag_pct
+FROM autorag_query_log
+GROUP BY hour
+ORDER BY hour DESC;
+
+.quit
+
+
+================================================================================
+  10. RESET / CLEAR UTILITIES
+================================================================================
+
+# Wipe both Pinecone AND all 9 SQLite tables (full reset)
+python db/clear_db.py --all --confirm
+
+# Wipe only Pinecone vectors (keep SQLite logs)
+python db/clear_db.py --vectors --confirm
+
+# Wipe only SQLite tables (keep Pinecone)
+python db/clear_db.py --logs --confirm
+
+# Interactive mode — prompts for confirmation
+python db/clear_db.py --all
+
+# Delete one specific query (and its associated events / reports / snapshots)
+python db/del_query.py
+# Prompts for the QueryLog ID interactively.
+
+# One-time column migration helper (only needed once, after schema upgrade)
+python db/migrate_add_chunks.py
+
+
+================================================================================
+  11. TROUBLESHOOTING
+================================================================================
+
+# Is the backend reachable?
+curl.exe http://localhost:8000/api/v1/logs?limit=1
+
+# Is Ollama responding?
+curl.exe http://localhost:11434/api/tags
+
+# Check what auto_worker is doing right now — watch its terminal output.
+# Heartbeat lines look like:
+#   ⏳ Waiting: 3 pending events, but threshold not met (count=3/5, ratio=18%/30%)
+# When the threshold is met it prints a banner and processes each event.
+
+# If the cascade keeps marking everything UNFIXABLE:
+#   - Check gemma3:27b is pulled:  ollama list
+#   - Lower SCORE_LOW / COHERENCE_RATIO in detector/detectors.py if too sensitive
+#   - Look at AdaptationLog "cascade_steps" to see which strategies failed and why
+
+# If queries are slow (> 5s):
+#   - mistral inference is the floor (~2.7s). Swap to llama3.2:3b for speed.
+#   - Confirm GT enrichment + detection are running on the background thread
+#     (look for [retrieval] async messages in uvicorn output)
+
+
+================================================================================
+  12. DATASET MANAGEMENT
+================================================================================
+
+# Default GT dataset path is dataset/long_ans.json.
+# To switch datasets, edit config.py:
+#   gt_dataset_path: str = "dataset/Qun_Ans1.json"
+# OR set in .env:
+#   GT_DATASET_PATH=dataset/Qun_Ans1.json
+# Then restart uvicorn (gt_lookup caches on first read).
+
+# After editing the JSON file in place WITHOUT restarting uvicorn, you'd need
+# to call gt_lookup.reload_dataset() — there's no endpoint for this yet, but
+# restarting uvicorn is the simplest path.
+
+
+================================================================================
+  END OF FILE
+================================================================================

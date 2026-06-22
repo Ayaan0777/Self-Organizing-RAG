@@ -1,0 +1,65 @@
+version: "3.9"
+
+services:
+  api:
+    image: wizard185/self-organising-rag:latest
+    container_name: rag-api
+
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port 8000
+
+    env_file:
+      - .env
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      - rag_db:/app/db
+
+    restart: unless-stopped
+
+  worker:
+    image: wizard185/self-organising-rag:latest
+    container_name: rag-worker
+
+    command: python auto_worker.py
+
+    env_file:
+      - .env
+
+    volumes:
+      - rag_db:/app/db
+
+    depends_on:
+      - api
+
+    restart: unless-stopped
+
+  dashboard:
+    image: wizard185/self-organising-rag:latest
+    container_name: rag-dashboard
+
+    command: >
+      streamlit run dashboard/app.py
+      --server.address=0.0.0.0
+      --server.port=8501
+
+    env_file:
+      - .env
+
+    ports:
+      - "8501:8501"
+
+    volumes:
+      - rag_db:/app/db
+
+    depends_on:
+      - api
+
+    restart: unless-stopped
+
+volumes:
+  rag_db:
