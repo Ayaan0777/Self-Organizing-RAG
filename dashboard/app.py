@@ -296,7 +296,7 @@ label[data-testid="stWidgetLabel"] p {
 /* Section header */
 .sec-header {
     font-family: var(--font-mono);
-    font-size: 0.72rem;
+    font-size: 0.95rem;
     color: var(--cyan);
     letter-spacing: 3px;
     text-transform: uppercase;
@@ -403,7 +403,7 @@ label[data-testid="stWidgetLabel"] p {
     opacity: 0.8;
 }
 .answer-label::before { content: '▸ '; }
-.answer-text  { color: var(--text); font-size: 0.88rem; line-height: 1.8; }
+.answer-text  { color: var(--text); font-size: 1.15rem; line-height: 1.8; }
 
 /* Severity badges */
 .sev-high   { color: var(--red);   font-weight: 700; letter-spacing: 1px; }
@@ -927,8 +927,7 @@ elif page == "Add Chunks":
     term_div()
     st.markdown(
         '<div style="font-family:var(--font-mono);font-size:0.8rem;color:#4a5280;margin-bottom:12px;">'
-        'Paste raw text below to preview how it will be chunked. '
-        'Optionally ingest chunks directly to Pinecone.'
+        'Paste raw text to preview chunk generation and use Ingest to embed the generated chunks into Pinecone.'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -1016,11 +1015,11 @@ elif page == "Query Diagnostics":
         # ── Pagination controls ──
         nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
         with nav1:
-            if st.button("◂ PREV", disabled=(current_page == 0), key="diag_prev"):
+            if st.button("◂ NEW", disabled=(current_page == 0), key="diag_prev"):
                 st.session_state.diag_page -= 1
                 st.rerun()
         with nav2:
-            if st.button("NEXT ▸", disabled=(current_page >= total_pages - 1), key="diag_next"):
+            if st.button("OLD ▸", disabled=(current_page >= total_pages - 1), key="diag_next"):
                 st.session_state.diag_page += 1
                 st.rerun()
         with nav3:
@@ -1034,11 +1033,11 @@ elif page == "Query Diagnostics":
                 unsafe_allow_html=True,
             )
         with nav4:
-            if st.button("◂◂ FIRST", disabled=(current_page == 0), key="diag_first"):
+            if st.button("◂◂ NEWEST", disabled=(current_page == 0), key="diag_first"):
                 st.session_state.diag_page = 0
                 st.rerun()
         with nav5:
-            if st.button("LAST ▸▸", disabled=(current_page >= total_pages - 1), key="diag_last"):
+            if st.button("OLDEST ▸▸", disabled=(current_page >= total_pages - 1), key="diag_last"):
                 st.session_state.diag_page = total_pages - 1
                 st.rerun()
 
@@ -1545,20 +1544,7 @@ elif page == "Flagged Events":
                 chunks_after = report.get("chunks_after_text") or []
                 dyn_k = report.get("dynamic_k")
 
-                # Deduplicate chunks
-                def _dedup(chunks):
-                    seen = set()
-                    out = []
-                    for c in chunks:
-                        key = c[:200].strip()  # compare first 200 chars
-                        if key not in seen:
-                            seen.add(key)
-                            out.append(c)
-                    return out
 
-                original_chunks = _dedup(original_chunks)
-                chunks_before = _dedup(chunks_before)
-                chunks_after = _dedup(chunks_after)
 
                 if original_chunks or dyn_k or chunks_before or chunks_after:
                     term_div()
@@ -1612,7 +1598,7 @@ elif page == "Flagged Events":
                                         font-family: 'JetBrains Mono', monospace; font-size: 0.72rem;
                                         color: #8899cc; line-height: 1.5;">
                                 <span style="color: var(--cyan); font-weight: 600; font-size: 0.68rem;
-                                             letter-spacing: 2px;">CHUNK {i+1} / 5</span><br>
+                                             letter-spacing: 2px;">CHUNK {i+1} / {len(original_chunks)}</span><br>
                                 {preview}
                             </div>
                             """, unsafe_allow_html=True)

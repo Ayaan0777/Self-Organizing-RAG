@@ -83,10 +83,10 @@ curl.exe -X POST http://localhost:8000/api/v1/query `
   5. EVALUATION
 ================================================================================
 
-# Single question with ground truth
-curl.exe -X POST http://localhost:8000/api/v1/evaluate `
-  -H "Content-Type: application/json" `
-  -d "{\"question\":\"...\",\"ground_truth\":\"...\"}"
+# Single question with ground truth (DEPRECATED - Route Removed)
+# curl.exe -X POST http://localhost:8000/api/v1/evaluate `
+#   -H "Content-Type: application/json" `
+#   -d "{\"question\":\"...\",\"ground_truth\":\"...\"}"
 
 # Batch evaluation against the long_ans.json dataset (first 30 questions)
 curl.exe -F "file=@dataset/long_ans.json" `

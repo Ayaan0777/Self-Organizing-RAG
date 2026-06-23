@@ -57,7 +57,8 @@ def get_llm():
     """
     global _cached_llm
     if _cached_llm is not None:
-        return _cached_llm
+        if getattr(_cached_llm, "model", None) == settings.llm_model_name:
+            return _cached_llm
 
     if settings.llm_provider.lower() == "ollama":
         _cached_llm = ChatOllama(
@@ -82,7 +83,8 @@ def get_fallback_llm():
     """
     global _cached_fallback_llm
     if _cached_fallback_llm is not None:
-        return _cached_fallback_llm
+        if getattr(_cached_fallback_llm, "model", None) == settings.fallback_llm_model:
+            return _cached_fallback_llm
 
     _cached_fallback_llm = ChatOllama(
         model=settings.fallback_llm_model,

@@ -324,7 +324,7 @@ def _run_s3_combined(event, log, diagnosis_result, metrics_before):
 
 def _run_s4_alt_llm(event, log, diagnosis_result, metrics_before):
     """
-    Strategy 4 — Alternate LLM (gemma3:27b).
+    Strategy 4 — Alternate LLM.
     Same chunks, no Pinecone change. Swaps LLM for a larger model.
 
     S4 cannot use _is_improved as-is: top1_score is unchanged (same chunks),
@@ -356,7 +356,8 @@ def _run_s4_alt_llm(event, log, diagnosis_result, metrics_before):
             "Answer:"
         )
 
-        print(f"[cascade] S4: Trying alt LLM (gemma3:27b) on same chunks...")
+        model_name = settings.fallback_llm_model
+        print(f"[cascade] S4: Trying alt LLM ({model_name}) on same chunks...")
         fallback_answer = fallback_llm.invoke(prompt).content.strip()
 
         metrics_after = dict(metrics_before)
@@ -376,7 +377,7 @@ def _run_s4_alt_llm(event, log, diagnosis_result, metrics_before):
             "skip_improve_check": True,
             "win": win,
             "details": {
-                "llm_used": "gemma3:27b",
+                "llm_used": model_name,
                 "k_used": 5,
                 "chunk_size": None,
                 "chunk_overlap": None,

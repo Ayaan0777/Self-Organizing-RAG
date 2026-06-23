@@ -16,8 +16,6 @@ class Settings(BaseSettings):
     llm_model_name: str = "mistral"
     fallback_llm_model: str = "gemma3:27b"
 
-    # Gemini (for evaluation)
-    gemini_api_key: str = ""
 
     # Stage 2-4: Self-healing thresholds
     precision_threshold: float = 0.4       # retrieval precision below this triggers repair (decision engine check)
@@ -30,7 +28,7 @@ class Settings(BaseSettings):
     poll_interval_seconds: int = 5
 
     # Detector settings (Low Recall Trigger thresholds)
-    score_low: float = 0.65
+    score_low: float = 0.15
     score_drop: float = 0.15
     coherence_ratio: float = 0.65
     evidence_match: float = 0.60

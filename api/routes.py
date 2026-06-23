@@ -11,11 +11,6 @@ class QueryReq(BaseModel):
     namespace: str = None
 
 
-class EvalReq(BaseModel):
-    question: str
-    ground_truth: str
-
-
 # ── Core RAG endpoints ────────────────────────────────────────
 @router.post("/ingest")
 async def ingest_endpoint(
@@ -28,11 +23,6 @@ async def ingest_endpoint(
 @router.post("/query")
 async def query_endpoint(req: QueryReq):
     return retrieval.answer_query(req.query, req.namespace)
-
-
-@router.post("/evaluate")
-async def eval_endpoint(req: EvalReq):
-    return evaluation.calculate_metrics(req.question, req.ground_truth)
 
 
 # ── Add Chunks endpoint ───────────────────────────────────────
