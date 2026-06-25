@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   api:
     image: wizard185/self-organising-rag:latest
@@ -17,7 +15,6 @@ services:
       - "8000:8000"
 
     volumes:
-      - .:/app
       - rag_db:/app/db
 
     restart: unless-stopped
@@ -32,7 +29,6 @@ services:
       - .env
 
     volumes:
-      - .:/app
       - rag_db:/app/db
 
     depends_on:
@@ -53,13 +49,12 @@ services:
       - .env
 
     environment:
-      - BACKEND_API_URL=http://api:8000/api/v1
+      BACKEND_API_URL: http://api:8000/api/v1
 
     ports:
       - "8501:8501"
 
     volumes:
-      - .:/app
       - rag_db:/app/db
 
     depends_on:

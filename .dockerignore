@@ -23,6 +23,9 @@ dataset/
 *.sqlite
 *.sqlite3
 
+db/*.db
+db/*.sqlite
+db/*.sqlite3
 Dockerfile
 docker-compose.yml
 
