@@ -78,8 +78,8 @@ The default configuration uses these models:
 **1. Clone the repository**
 
 ```bash
-git clone https://github.com/Ayaan0777/Self-Oragnising-RAG.git
-cd Self-Oragnising-RAG
+git clone https://github.com/Ayaan0777/Self-Organizing-RAG.git
+cd Self-Organizing-RAG
 ```
 
 **2. Install Python dependencies**
@@ -128,8 +128,8 @@ The API will be available at `http://localhost:8000/docs` (Swagger UI) and the d
 **1. Clone and configure**
 
 ```bash
-git clone https://github.com/Ayaan0777/Self-Oragnising-RAG.git
-cd Self-Oragnising-RAG
+git clone https://github.com/Ayaan0777/Self-Organizing-RAG.git
+cd Self-Organizing-RAG
 cp env_format.txt .env
 ```
 
@@ -284,7 +284,7 @@ All endpoints are prefixed with `/api/v1`. Swagger UI available at `http://local
 ## Project Structure
 
 ```
-Self-Oragnising-RAG/
+Self-Organizing-RAG/
 ├── api/                  # FastAPI route definitions (19 endpoints)
 ├── controllers/          # Core logic — ingestion, retrieval, evaluation, metrics, GT lookup
 ├── organiser/            # Retrieval gate (2-tier query classification)
@@ -395,4 +395,4 @@ This project was developed as part of an academic collaboration with HPE. Licens
 
 ## Contributing
 
-For questions, bug reports, or contributions, please open an issue on the [GitHub repository](https://github.com/Ayaan0777/Self-Oragnising-RAG).
+For questions, bug reports, or contributions, please open an issue on the [GitHub repository](https://github.com/Ayaan0777/Self-Organizing-RAG).
